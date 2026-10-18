@@ -1,0 +1,8 @@
+# the build context of ./Dockerfile (the repository root): the two packages it installs, nothing else
+*
+!aitermk/megakernels/qwen38_27b
+!aitermk/engine_adapters/vllm
+**/__pycache__
+**/*.egg-info
+**/build
+**/.pytest_cache

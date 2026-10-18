@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitermk-vllm-plugin"
+version = "0.1.0"
+description = "vLLM plugin: AITerMK megakernels in vLLM's serving paths (Qwen3.8-27B + DFlash2 on gfx950)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."vllm.general_plugins"]
+aitermk_qwen38_dflash = "aitermk_vllm_plugin.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

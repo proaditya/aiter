@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitermk-qwen38"
+version = "0.1.0"
+description = "Qwen3.8-27B megakernel (verify) and DFlash2 drafter for gfx950: FlyDSL sources, code-object builds, engine-agnostic runtime"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["python"]

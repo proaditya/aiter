@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitermk-sglang"
+version = "0.1.0"
+description = "SGLang plugin: AITerMK megakernels in SGLang's serving paths (Qwen3.8-27B + DFlash2 on gfx950)"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.entry-points."sglang.srt.plugins"]
+aitermk_qwen38_dflash = "aitermk_sglang.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

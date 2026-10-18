@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Native builds and packages
+build/
+_skbuild/
+dist/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.o
+*.a
+*.so
+*.dylib
+*.whl
+
+# Code objects, exports and local data stay out of the repository
+*.hsaco
+evidence/
+artifacts/
+*.tar.gz
+
+# Models/checkpoints must never enter this repository
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.bin
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
