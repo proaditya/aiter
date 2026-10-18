@@ -1,0 +1,272 @@
+/* Copyright 2025 CMU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// MoE residual addition from float32 workspace for MI300/MI350.
+//
+// Replaces moe_mul_sum_add when W2 already did routing weight multiplication
+// and wrote each expert's contribution to its own slot of the f32 workspace.
+//
+// output[b, h] = bf16(sum_s workspace_f32[b, s, h] + residual_bf16[b, h])
+//
+// The slot sum runs in fixed compile-time order and touches only row `b`, so
+// the result cannot depend on expert arrival order or on batch composition.
+// See moe_ws_layout.cuh.
+//
+// This one consumer still zeroes, even though the producer now assigns rather
+// than accumulates. It is the LAST layer's consumer, and the next thing to read
+// the workspace is layer 0's QKV prologue on the following iteration -- which
+// adds it to the embedding unconditionally, before any MoE has run. Leave it
+// populated and every token double-counts layer 35's MoE output. The
+// per-layer prologues need no zero pass; this boundary does.
+
+#pragma once
+
+#include <hip/hip_bf16.h>
+#include <hip/hip_runtime.h>
+
+#include "mpk_atoms.cuh" // st_wt_zero128
+#include "moe_ws_layout.cuh"
+
+namespace kernel {
+
+template <int BATCH_SIZE, int OUTPUT_SIZE, int OUTPUT_STRIDE>
+__device__ __forceinline__ void moe_residual_add_f32_mi300_impl(
+    void *workspace_f32_ptr, void const *residual_ptr, void *output_ptr) {
+  float *__restrict__ d_ws = static_cast<float *>(workspace_f32_ptr);
+  unsigned short const *__restrict__ d_res =
+      static_cast<unsigned short const *>(residual_ptr);
+  unsigned short *__restrict__ d_out =
+      static_cast<unsigned short *>(output_ptr);
+
+  // Vectorized: float4 for f32 workspace loads, uint2 for bf16 residual/output
+  constexpr int VEC = 4;
+  constexpr int BLOCK_VEC = 256 * VEC; // assumes blockDim.x == 256
+
+  // ACQUIRE against the W2 producers, and it must be `sc1` (vL1 + L2).
+  //
+  // This task is the ONLY consumer of moe_workspace_f32 that is not the fused
+  // layer's QKV prologue, and it is the only one that was missing this. The
+  // prologue's acquire lives at the top of gang_full_layer_fused_mi300.cuh and
+  // its comment states the contract: W2 writes the workspace with
+  // `st_wt_f32x4` (sc0 sc1), which bypasses L2 and lands in HBM, and the
+  // producing W2 tile runs on a different XCD than this consumer. MI300/MI350
+  // L2 is not coherent across XCDs, so without this invalidate a line this XCD
+  // already holds -- from *last* iteration's read of the same address, since
+  // this task reads the identical buffer every iteration -- is served straight
+  // out of L2 and returns the previous iteration's value.
+  //
+  // Kept as `sc1` while the five sites in the fused-layer path were reduced to
+  // plain `buffer_inv`. Two reasons, and the first is the real one:
+  //
+  //   * This consumer sits OUTSIDE the fused layer, at the iteration boundary
+  //     (it consumes layer 35 and the next reader is layer 0's QKV prologue on
+  //     the following iteration). The Phase 9 layer barrier is what makes
+  //     vL1-only sufficient for the in-layer sites, and it does not order this
+  //     one. The argument that retires `sc1` there does not reach here.
+  //   * It is free anyway: ablating it measured 3.456 vs 3.455 ms, i.e. within
+  //     run-to-run noise. This task runs once per iteration, not once per
+  //     layer per worker, so there is nothing to recover.
+  //
+  // See the layer-boundary acquire at the top of
+  // gang_full_layer_fused_mi300.cuh for the full ablation.
+  asm volatile("buffer_inv" MPK_DEV_SC_INV "" ::: "memory");
+
+#ifdef MPK_RESADD_ILP  // MPK_RESADD_ILP_PATCHED
+#if defined(MPK_WSF32_REP) || defined(MPK_WSF32_AID) || defined(MPK_WS_FARCOPY)
+#error "MPK_RESADD_ILP: plain workspace layout only"
+#endif
+#ifndef MPK_RESADD_G
+#define MPK_RESADD_G 4
+#endif
+  {
+    constexpr int NCH = (OUTPUT_SIZE + BLOCK_VEC - 1) / BLOCK_VEC;  // chunks of 256 x 4 per row
+    constexpr int NIT = BATCH_SIZE * NCH;
+    constexpr int G = MPK_RESADD_G;
+    auto f2bf16 = [](float f) -> unsigned short {
+      union {
+        float f;
+        unsigned u;
+      } v;
+      v.f = f;
+      unsigned rounding_bias = ((v.u >> 16) & 1) + 0x7FFF;
+      return (unsigned short)((v.u + rounding_bias) >> 16);
+    };
+#pragma unroll
+    for (int i0 = 0; i0 < NIT; i0 += G) {
+      float4 wsv[G][MOE_WS_SLOTS];
+      uint2 rpk[G];
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        int const it = i0 + g;
+        int const row = it / NCH;
+        int const off = (it % NCH) * BLOCK_VEC + threadIdx.x * VEC;
+        if (it < NIT && off < OUTPUT_SIZE) {
+          float const *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+#pragma unroll
+          for (int sl = 0; sl < MOE_WS_SLOTS; ++sl) {
+            __builtin_memcpy(&wsv[g][sl], ws_row + sl * OUTPUT_STRIDE + off, 16);
+          }
+          __builtin_memcpy(&rpk[g], d_res + row * OUTPUT_STRIDE + off, 8);
+        }
+      }
+#pragma unroll
+      for (int g = 0; g < G; ++g) {
+        int const it = i0 + g;
+        int const row = it / NCH;
+        int const off = (it % NCH) * BLOCK_VEC + threadIdx.x * VEC;
+        if (it < NIT && off < OUTPUT_SIZE) {
+          float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+#pragma unroll
+          for (int sl = 0; sl < MOE_WS_SLOTS; ++sl) st_wt_zero128(ws_row + sl * OUTPUT_STRIDE + off);
+          float4 ws4 = wsv[g][0];
+#pragma unroll
+          for (int sl = 1; sl < MOE_WS_SLOTS; sl++) {
+            ws4.x += wsv[g][sl].x;
+            ws4.y += wsv[g][sl].y;
+            ws4.z += wsv[g][sl].z;
+            ws4.w += wsv[g][sl].w;
+          }
+          uint2 const res_packed = rpk[g];
+          unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+          unsigned r1 = res_packed.x & 0xFFFF0000u;
+          unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+          unsigned r3 = res_packed.y & 0xFFFF0000u;
+          float rv0, rv1, rv2, rv3;
+          __builtin_memcpy(&rv0, &r0, 4);
+          __builtin_memcpy(&rv1, &r1, 4);
+          __builtin_memcpy(&rv2, &r2, 4);
+          __builtin_memcpy(&rv3, &r3, 4);
+          float s0 = ws4.x + rv0, s1 = ws4.y + rv1;
+          float s2 = ws4.z + rv2, s3 = ws4.w + rv3;
+          uint2 out_packed;
+          out_packed.x = (unsigned)f2bf16(s0) | ((unsigned)f2bf16(s1) << 16);
+          out_packed.y = (unsigned)f2bf16(s2) | ((unsigned)f2bf16(s3) << 16);
+          __builtin_memcpy(d_out + row * OUTPUT_STRIDE + off, &out_packed, 8);
+        }
+      }
+    }
+  }
+#else
+  for (int row = 0; row < BATCH_SIZE; ++row) {
+    float *ws_row = d_ws + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    float *ws_rd = ws_row;
+#ifdef MPK_WSF32_REP
+    float *ws_z0 = nullptr, *ws_z1 = nullptr;
+    if (float *wsr = mpk_wsf32_rep(mpk_hof_aid())) {
+      ws_rd = wsr + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z0 = mpk_wsf32_rep(0) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+      ws_z1 = mpk_wsf32_rep(1) + moe_ws_offset(row, 0, OUTPUT_STRIDE);
+    }
+#endif
+    unsigned short const *res_row = d_res + row * OUTPUT_STRIDE;
+    unsigned short *out_row = d_out + row * OUTPUT_STRIDE;
+
+#pragma unroll
+    for (int off = threadIdx.x * VEC; off < OUTPUT_SIZE; off += BLOCK_VEC) {
+      // Vectorized load: 4 f32 per topk slot (flat_load_dwordx4), summed in
+      // fixed slot order.
+      //
+      // The zero stores are WRITE-THROUGH for the same reason W2's value
+      // stores are (see moe_ws_layout.cuh): their consumer is the *next*
+      // iteration's layer-0 QKV prologue, which runs on all 8 XCDs while this
+      // task runs on one. A plain store stops in this XCD's L2 and the other
+      // seven never see the zero -- they read layer 35's leftover MoE output
+      // and add it to the embedding, which is exactly the double-count this
+      // zero pass exists to prevent.
+      float4 ws4;
+      __builtin_memcpy(&ws4, ws_rd + off, 16);
+      st_wt_zero128(ws_row + off);
+#ifdef MPK_WSF32_REP
+      if (ws_z0) {
+        st_wt_zero128(ws_z0 + off);
+        st_wt_zero128(ws_z1 + off);
+      }
+#endif
+      #ifdef MPK_WSF32_AID
+      // This task runs on ONE XCD but the next iteration's layer 0 reads the
+      // workspace on all 8, so with a copy per range BOTH must be zeroed or
+      // the other AID double-counts the last layer's MoE output.
+      st_wt_zero128((ws_row + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+      #endif
+#pragma unroll
+      for (int s = 1; s < MOE_WS_SLOTS; s++) {
+        float4 slot4;
+#ifdef MPK_WS_FARCOPY
+        // W2 writes only its own AID's copy, so slots 2-3 live in the AID1
+        // copy; the helper's copy into AID0 is not ordered against this task.
+        __builtin_memcpy(&slot4, ws_rd + (s >= 2 ? MOE_WS_SLOTS * OUTPUT_STRIDE : 0) +
+                                     s * OUTPUT_STRIDE + off, 16);
+#else
+        __builtin_memcpy(&slot4, ws_rd + s * OUTPUT_STRIDE + off, 16);
+#endif
+        st_wt_zero128(ws_row + s * OUTPUT_STRIDE + off);
+#ifdef MPK_WSF32_REP
+        if (ws_z0) {
+          st_wt_zero128(ws_z0 + s * OUTPUT_STRIDE + off);
+          st_wt_zero128(ws_z1 + s * OUTPUT_STRIDE + off);
+        }
+#endif
+        #ifdef MPK_WSF32_AID
+        // This task runs on ONE XCD but the next iteration's layer 0 reads the
+        // workspace on all 8, so with a copy per range BOTH must be zeroed or
+        // the other AID double-counts the last layer's MoE output.
+        st_wt_zero128((ws_row + s * OUTPUT_STRIDE + off) + MOE_WS_SLOTS * OUTPUT_STRIDE);
+        #endif
+        ws4.x += slot4.x;
+        ws4.y += slot4.y;
+        ws4.z += slot4.z;
+        ws4.w += slot4.w;
+      }
+
+      // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
+      uint2 res_packed;
+      __builtin_memcpy(&res_packed, res_row + off, 8);
+
+      // Extract 4 bf16 → f32
+      unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+      unsigned r1 = res_packed.x & 0xFFFF0000u;
+      unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+      unsigned r3 = res_packed.y & 0xFFFF0000u;
+      float rv0, rv1, rv2, rv3;
+      __builtin_memcpy(&rv0, &r0, 4);
+      __builtin_memcpy(&rv1, &r1, 4);
+      __builtin_memcpy(&rv2, &r2, 4);
+      __builtin_memcpy(&rv3, &r3, 4);
+
+      // Add and convert to bf16, pack into uint2 for vectorized store
+      float s0 = ws4.x + rv0, s1 = ws4.y + rv1;
+      float s2 = ws4.z + rv2, s3 = ws4.w + rv3;
+
+      // bf16 conversion with rounding
+      auto f2bf16 = [](float f) -> unsigned short {
+        union {
+          float f;
+          unsigned u;
+        } v;
+        v.f = f;
+        unsigned rounding_bias = ((v.u >> 16) & 1) + 0x7FFF;
+        return (unsigned short)((v.u + rounding_bias) >> 16);
+      };
+
+      uint2 out_packed;
+      out_packed.x = (unsigned)f2bf16(s0) | ((unsigned)f2bf16(s1) << 16);
+      out_packed.y = (unsigned)f2bf16(s2) | ((unsigned)f2bf16(s3) << 16);
+      __builtin_memcpy(out_row + off, &out_packed, 8);
+    }
+  }
+#endif  // MPK_RESADD_ILP
+}
+
+} // namespace kernel

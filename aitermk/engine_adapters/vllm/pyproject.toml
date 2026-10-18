@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aitermk-fleet-vllm"
+version = "0.1.0"
+description = "vLLM plugin: the GPT-OSS-120B persistent megakernel (gfx950, DPX+NPS2) in vLLM's serving path"
+requires-python = ">=3.10"
+dependencies = ["safetensors>=0.4.3"]
+
+[project.entry-points."vllm.general_plugins"]
+fleet_mk = "fleet_vllm.plugin:register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

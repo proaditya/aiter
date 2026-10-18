@@ -1,0 +1,767 @@
+/* Copyright 2025 CMU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+#ifndef MPK_TIDX_M_M
+#if defined(MPK_TID_FRESH) || defined(MPK_TID_FRESH_M)
+// threadIdx.x through a volatile v_mov: nothing derived from it can be hoisted out of the
+// persistent loop into kernel-lifetime registers.
+__device__ __forceinline__ unsigned mpk_tid_fresh_M() {
+  unsigned t;
+  asm volatile("v_mov_b32 %0, %1\n\ts_nop 1" : "=v"(t) : "v"(threadIdx.x));
+  return t;
+}
+#define MPK_TIDX_M (mpk_tid_fresh_M())
+#else
+#define MPK_TIDX_M (threadIdx.x)
+#endif
+#endif
+
+#if defined(MPK_MERGE_O_EARLY2) && (!defined(MPK_MERGE_TWO_PASS) || !defined(MPK_MERGE_KV_OUTER) || \
+                                    defined(MPK_MERGE_O_PRELOAD))
+#error "MPK_MERGE_O_EARLY2 is on the KV-outer two-pass arm, instead of MPK_MERGE_O_PRELOAD"
+#endif
+#if defined(MPK_ATS_MERGE) && defined(MPK_ATSOPS_AT)
+#define MPK_ATS_MRG(k, dep)                                             \
+  do {                                                                   \
+    asm volatile("" ::"v"(dep));                                       \
+    MPK_ATSOPS_AT(k, MPK_TIDX_M == 0);                                   \
+  } while (0)
+#else
+#define MPK_ATS_MRG(k, dep) do {} while (0)
+#endif
+#if defined(MPK_MERGE_O_PRELOAD) && !defined(MPK_MERGE_TWO_PASS)
+#error "MPK_MERGE_O_PRELOAD splits two-pass O loads from FMAs; needs TWO_PASS"
+#endif
+#if defined(MPK_MERGE_O_PRELOAD) && !defined(MPK_MERGE_KV_OUTER)
+#error "MPK_MERGE_O_PRELOAD is on the KV-outer two-pass arm"
+#endif
+
+// this kernel merges the result of one KV head chunk back to the full KV
+// cache，
+// it taks the output of multitoken_paged_attention_task_impl_32_64_split_kv and
+// the log exp sum as input,
+namespace kernel {
+
+// Native vector types for address-space-qualified loads in the two-pass merge.
+// HIP's float2/float4 are HIP_vector_type class templates and cannot be
+// copy-constructed through an AS(1) pointer; these can. See the comment at
+// their use in merge_splitkv_ck_fmha for why GLOBAL rather than generic FLAT
+// is load-bearing here.
+typedef float _mg_f32x2 __attribute__((ext_vector_type(2)));
+typedef float _mg_f32x4 __attribute__((ext_vector_type(4)));
+
+template <typename T,
+          int NUM_QO_HEADS_PER_KV,
+          int NUM_KV_HEADS,
+          int NUM_QO_GROUPS,
+          int HEAD_DIM,
+          int MAX_TOKENS = 8,
+          bool PARTITION_KV = true,
+          int NUM_KV_CHUNKS = 1,
+          int KV_CHUNK_SIZE = 256,
+          int PAGE_SIZE = 4096,
+          typename OaccT = T>
+__device__ __forceinline__ void
+    merge_splitkv(void const *lse,
+                  void const *o,
+                  int const *qo_indptr_buffer_ptr,
+                  int const *paged_kv_indptr_buffer_ptr,
+                  int const *paged_kv_last_page_len_buffer_ptr,
+                  int16_t request_id,
+                  void *output,
+                  int merge_task_offset) {
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
+#endif
+  OaccT const *o_ptr = reinterpret_cast<OaccT const *>(o);
+  T *output_ptr = reinterpret_cast<T *>(output);
+  float const *lse_ptr = reinterpret_cast<float const *>(lse);
+  // constexpr int GLOBAL_ITERS_M = (NUM_QO_HEADS_PER_KV + 64 - 1) / 64;
+
+  int const first_page_pos = paged_kv_indptr_buffer_ptr[request_id];
+  int const last_page_pos = paged_kv_indptr_buffer_ptr[request_id + 1];
+  int const num_pages = last_page_pos - first_page_pos;
+  int seq_len = (num_pages - 1) * PAGE_SIZE +
+                paged_kv_last_page_len_buffer_ptr[request_id];
+
+  int num_chunks = (seq_len + KV_CHUNK_SIZE - 1) / KV_CHUNK_SIZE;
+
+  // size of o and output is NUM_QO_HEADS_PER_KV * MAX_TOKENS * 128
+  // let each thread process one
+  //  constexpr int NUM_QO_PER_KV = NUM_QO_HEADS_PER_KV / NUM_KV_HEADS;
+  //  constexpr int NUM_Q = MAX_TOKENS * NUM_QO_PER_KV;
+  //  constexpr int GLOBAL_ITERS_M = (NUM_Q + 64 - 1) / 64;
+
+  int const first_token_pos = qo_indptr_buffer_ptr[request_id];
+  int const last_token_pos = qo_indptr_buffer_ptr[request_id + 1];
+  // Exit the current task is number of query tokens is zero
+  if (first_token_pos == last_token_pos) {
+    return;
+  }
+  int const num_tokens = last_token_pos - first_token_pos;
+
+  constexpr int THREADS_PER_TOKEN = 16; // let 16 threads process one head
+  constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
+  constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
+
+  int thread_in_group = MPK_TIDX_M % THREADS_PER_TOKEN;
+  int group_id = MPK_TIDX_M / THREADS_PER_TOKEN;
+  int head_partition = thread_in_group;
+
+  // let 16 threads to process one head_dim
+#pragma unroll 1
+  for (int tok = group_id; tok < num_tokens * NUM_QO_HEADS_PER_KV;
+       tok += num_groups) {
+
+    int token_idx = tok / NUM_QO_HEADS_PER_KV;
+    int head_idx = tok % NUM_QO_HEADS_PER_KV;
+
+#pragma unroll 1
+    for (int i = 0; i < VAL_PER_THREAD; ++i) {
+      float m_global = -inf;
+      float d_global = 1.f;
+      float o_global = 0.f;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        // process 8 tokens
+        float m_prev = m_global,
+              d_prev = d_global; // save previous values
+        // int lse_offset = kv_idx * (MAX_TOKENS * NUM_QO_HEADS_PER_KV) + tok;
+        // int o_offset = (kv_idx * (MAX_TOKENS * NUM_QO_HEADS_PER_KV) + tok) *
+        // HEAD_DIM +  head_partition * VAL_PER_THREAD + i;
+
+        int lse_offset = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * NUM_QO_GROUPS *
+                             NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+        // int lse_offset = merge_task_offset * NUM_QO_HEADS_PER_KV + head_idx +
+        // kv_idx * NUM_QO_HEADS_PER_KV + token_idx * NUM_QO_GROUPS *
+        // NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+        int o_offset =
+            lse_offset * HEAD_DIM + head_partition * VAL_PER_THREAD + i;
+
+        float other_m = lse_ptr[lse_offset], other_d = 1;
+        m_global = max(m_prev, other_m);
+        d_global = d_prev * ptx_exp2(m_prev - m_global) +
+                   other_d * ptx_exp2(other_m - m_global);
+        // accumulate o
+        float other_o = (float)o_ptr[o_offset];
+
+        o_global = o_global * ptx_exp2(m_prev - m_global) +
+                   other_o * ptx_exp2(other_m - m_global);
+      }
+      T out_val = (T)__fdividef(o_global, d_global);
+      output_ptr[(first_token_pos + token_idx) * NUM_QO_GROUPS *
+                     NUM_QO_HEADS_PER_KV * HEAD_DIM +
+                 head_idx * HEAD_DIM + head_partition * VAL_PER_THREAD + i] =
+          out_val;
+    }
+  }
+#ifdef MPK_ENABLE_DEVICE_TASK_TIMING
+  __syncthreads();
+  if (MPK_TIDX_M == 0 && blockIdx.x == 0) {
+    unsigned long long _dur = (__builtin_amdgcn_s_memrealtime() - _t0) * 10;
+    printf("[ATTN_MERGE] dur_us=%.1f\n", (double)_dur / 1000.0);
+  }
+#endif
+}
+
+// CK FMHA merge variant: reads float o_acc/lse_acc with interleaved kv_head
+// layout lse layout:  lse[token * (NUM_QO_GROUPS * NUM_KV_CHUNKS * QO_PER_KV)
+//                  + kv_head * NUM_KV_CHUNKS * QO_PER_KV
+//                  + chunk * QO_PER_KV + head]
+// o layout:    same indexing * HEAD_DIM + d
+// output layout: output[token * NUM_QO_GROUPS * QO_PER_KV * HEAD_DIM
+//                       + kv_head * QO_PER_KV * HEAD_DIM + head * HEAD_DIM + d]
+// MPK_MERGE_META_PRE: the sink merge_splitkv_ck_fmha would load for this
+// thread's first token, fetched ahead of the merge.
+template <int NUM_QO_HEADS_PER_KV>
+__device__ __forceinline__ float merge_splitkv_sink_log2(void const *sinks_ptr,
+                                                         int kv_head_idx) {
+#if defined(MPK_MERGE_WIDE_DIM)
+  constexpr int THREADS_PER_TOKEN = 16;
+#else
+  constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
+#endif
+  int const head_idx =
+      (int)(MPK_TIDX_M / THREADS_PER_TOKEN) % NUM_QO_HEADS_PER_KV;
+  __hip_bfloat16 const *d_sinks =
+      reinterpret_cast<__hip_bfloat16 const *>(sinks_ptr);
+  return static_cast<float>(
+             d_sinks[kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx]) *
+         1.44269504088896340736f;
+}
+
+#if defined(MPK_VTN_AOQ) && (defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN))
+__shared__ int s_aoq_on;  // MPK_VTN_AOQ_ABIP: this layer's pass takes the FP8 path
+#endif
+#ifdef MPK_VTN_AOQ
+#ifdef MPK_MERGE_WIDE_DIM
+#error "MPK_VTN_AOQ: one wave per 128-element block (no MPK_MERGE_WIDE_DIM)"
+#endif
+// MPK_VTN_AOQ: this lane's two bf16 outputs (elements e, e + 1; row e / 4096) as FP8 with their 128-element block's
+// E8M0 scale -- the O-proj staging's quantization (magnitude max of the bf16 values, _gang_compute_e8m0_fp8, the
+// bf16-pair conversion) -- into both AIDs' copies. All 64 lanes of the wave hold one block: lane l elements 2l, 2l+1.
+__device__ __forceinline__ void mpk_aoq_publish(int e, unsigned packed) {
+  unsigned const a = packed & 0x7FFF7FFFu;
+  unsigned m = (a & 0xFFFFu) > (a >> 16) ? (a & 0xFFFFu) : (a >> 16);
+  unsigned d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xB1, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4E, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  unsigned const m0 = (unsigned)__builtin_amdgcn_readlane((int)m, 0);
+  unsigned const m1 = (unsigned)__builtin_amdgcn_readlane((int)m, 16);
+  unsigned const m2 = (unsigned)__builtin_amdgcn_readlane((int)m, 32);
+  unsigned const m3 = (unsigned)__builtin_amdgcn_readlane((int)m, 48);
+  unsigned const ma = m0 > m1 ? m0 : m1;
+  unsigned const mb = m2 > m3 ? m2 : m3;
+  uint8_t const se = _gang_compute_e8m0_fp8(__uint_as_float((ma > mb ? ma : mb) << 16));
+  float scale_f = 1.0f;
+  if (se != 0) {
+    uint32_t const sbits = (uint32_t)se << 23;
+    __builtin_memcpy(&scale_f, &sbits, 4);
+  }
+  typedef __bf16 aoq_b2 __attribute__((ext_vector_type(2)));
+  aoq_b2 p;
+  __builtin_memcpy(&p, &packed, 4);
+  fp8x4_t pk = {};
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p, scale_f, false);
+  unsigned short q;
+  __builtin_memcpy(&q, &pk, 2);
+  int const row = e >> 12;
+  int const col = e & 4095;
+  int const off = row * MPK_AOQ_ROW_BYTES + col;
+  st_wt_u16(mpk_aoq_base(0) + off, q);
+  st_wt_u16(mpk_aoq_base(1) + off, q);
+  if ((threadIdx.x & 63) == 0) {
+    int const so = row * MPK_AOQ_ROW_BYTES + 4096 + (col >> 7);
+    st_wt_u8(mpk_aoq_base(0) + so, se);
+    st_wt_u8(mpk_aoq_base(1) + so, se);
+  }
+}
+#ifdef MPK_VTN_AOQ_INPLACE
+// MPK_VTN_AOQ_INPLACE: the same quantization as mpk_aoq_publish, stored into the bf16 row's own bytes.
+__device__ __forceinline__ void mpk_aoq_inplace(char *rows, int e, unsigned packed) {
+  unsigned const a = packed & 0x7FFF7FFFu;
+  unsigned m = (a & 0xFFFFu) > (a >> 16) ? (a & 0xFFFFu) : (a >> 16);
+  unsigned d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0xB1, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x4E, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x141, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  d = (unsigned)__builtin_amdgcn_update_dpp(0, (int)m, 0x140, 0xF, 0xF, false);
+  m = m > d ? m : d;
+  unsigned const m0 = (unsigned)__builtin_amdgcn_readlane((int)m, 0);
+  unsigned const m1 = (unsigned)__builtin_amdgcn_readlane((int)m, 16);
+  unsigned const m2 = (unsigned)__builtin_amdgcn_readlane((int)m, 32);
+  unsigned const m3 = (unsigned)__builtin_amdgcn_readlane((int)m, 48);
+  unsigned const ma = m0 > m1 ? m0 : m1;
+  unsigned const mb = m2 > m3 ? m2 : m3;
+  uint8_t const se = _gang_compute_e8m0_fp8(__uint_as_float((ma > mb ? ma : mb) << 16));
+  float scale_f = 1.0f;
+  if (se != 0) {
+    uint32_t const sbits = (uint32_t)se << 23;
+    __builtin_memcpy(&scale_f, &sbits, 4);
+  }
+  typedef __bf16 aoq_b2 __attribute__((ext_vector_type(2)));
+  aoq_b2 p;
+  __builtin_memcpy(&p, &packed, 4);
+  fp8x4_t pk = {};
+  pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_bf16(pk, p, scale_f, false);
+  unsigned short q;
+  __builtin_memcpy(&q, &pk, 2);
+  char *const r = rows + (e >> 12) * 8192;
+  int const col = e & 4095;
+  st_wt_u16(r + col, q);
+  if ((threadIdx.x & 63) == 0) {
+    st_wt_u8(r + 4096 + (col >> 9) * 128 + ((col >> 7) & 3), se);  // one line per die
+  }
+}
+#endif
+#endif  // MPK_VTN_AOQ
+template <typename T,
+          int NUM_QO_HEADS_PER_KV,
+          int NUM_QO_GROUPS,
+          int HEAD_DIM,
+          int NUM_KV_CHUNKS,
+          int KV_CHUNK_SIZE = 128,
+          int PAGE_SIZE = 4096,
+          bool WRITE_THROUGH = false,
+          int LOOP_CHUNKS = NUM_KV_CHUNKS,
+          bool META_PRE = false>
+__device__ __forceinline__ void
+    merge_splitkv_ck_fmha(float const *lse_ptr,
+                          float const *o_ptr,
+                          int const *qo_indptr_buffer_ptr,
+                          int const *paged_kv_indptr_buffer_ptr,
+                          int const *paged_kv_last_page_len_buffer_ptr,
+                          int16_t request_id,
+                          T *output_ptr,
+                          int kv_head_idx,
+                          void const *sinks_ptr = nullptr,
+                          int pre_q0 = 0,
+                          int pre_q1 = 0,
+                          float pre_sink_log2 = 0.0f) {
+
+  int const first_token_pos =
+      META_PRE ? pre_q0 : qo_indptr_buffer_ptr[request_id];
+  int const last_token_pos =
+      META_PRE ? pre_q1 : qo_indptr_buffer_ptr[request_id + 1];
+  if (first_token_pos == last_token_pos) {
+    return;
+  }
+  MPK_ATS_MRG(10, first_token_pos);
+  int const num_tokens = last_token_pos - first_token_pos;
+
+  // Use NUM_KV_CHUNKS (template param) as the chunk count — the CK FMHA
+  // pipeline processes exactly NUM_KV_CHUNKS chunks worth of data into
+  // o_acc/lse_acc
+  // Chunks merged: the first LOOP_CHUNKS slots (the caller guarantees the
+  // rest are empty, weight 0). A compile-time bound keeps the loads batched.
+  constexpr int num_chunks =
+      LOOP_CHUNKS < NUM_KV_CHUNKS ? LOOP_CHUNKS : NUM_KV_CHUNKS;
+
+  // Full token stride matches CK FMHA's LSE_STRIDE = NUM_KV_HEADS *
+  // NUM_KV_CHUNKS * QO_PER_KV
+  constexpr int LSE_TOKEN_STRIDE =
+      NUM_QO_GROUPS * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+  // Offset to this kv_head's slice within one token
+  int const lse_kv_offset = kv_head_idx * NUM_KV_CHUNKS * NUM_QO_HEADS_PER_KV;
+  // Output stride (full width across all kv_heads)
+  constexpr int OUT_TOKEN_STRIDE =
+      NUM_QO_GROUPS * NUM_QO_HEADS_PER_KV * HEAD_DIM;
+
+  // The default uses 32 threads per head so all eight groups in a 256-thread
+  // block own one GPT-OSS query head.  The opt-in arm deliberately uses only
+  // the first two waves: each live lane owns four adjacent dimensions rather
+  // than two, so every chunk is one global_load_dwordx4 instead of dwordx2
+  // and only 16 lanes redundantly evaluate its LSE/exp2 weight.  The inactive
+  // waves still reach the caller's publication barriers; no handoff or
+  // acquire protocol changes.
+#if defined(MPK_MERGE_WIDE_DIM)
+  constexpr int THREADS_PER_TOKEN = 16;
+#else
+  constexpr int THREADS_PER_TOKEN = (NUM_QO_HEADS_PER_KV <= 8) ? 32 : 16;
+#endif
+  constexpr int VAL_PER_THREAD = HEAD_DIM / THREADS_PER_TOKEN;
+  constexpr int num_groups = NUM_THREADS / THREADS_PER_TOKEN;
+  static_assert(VAL_PER_THREAD == 1 || VAL_PER_THREAD % 2 == 0,
+                "merge: VAL_PER_THREAD must be 1 or even; the AS(1) vector "
+                "loads in the two-pass arm assume natural alignment at the "
+                "vector width and fall back to scalars otherwise");
+
+  int thread_in_group = MPK_TIDX_M % THREADS_PER_TOKEN;
+  int group_id = MPK_TIDX_M / THREADS_PER_TOKEN;
+
+  // Optional sink correction (GPT-OSS): out *= 1 / (1 + exp(sink -
+  // LSE_natural)) Layout: sinks[num_q_heads] in bf16, indexed by
+  // kv_head_idx*NUM_QO_HEADS_PER_KV + head.
+  using __sink_bf16 = __hip_bfloat16;
+  __sink_bf16 const *d_sinks = reinterpret_cast<__sink_bf16 const *>(sinks_ptr);
+
+#pragma unroll
+  for (int tok = group_id; tok < num_tokens * NUM_QO_HEADS_PER_KV;
+       tok += num_groups) {
+    int token_idx = tok / NUM_QO_HEADS_PER_KV;
+    int head_idx = tok % NUM_QO_HEADS_PER_KV;
+
+    // Load this head's sink once (independent of dim).
+    float sink_val_log2 = 0.0f;
+    if (META_PRE && tok == group_id) {
+      sink_val_log2 = pre_sink_log2;
+    } else if (sinks_ptr != nullptr) {
+      sink_val_log2 =
+          static_cast<float>(
+              d_sinks[kv_head_idx * NUM_QO_HEADS_PER_KV + head_idx]) *
+          1.44269504088896340736f; // convert sink from ln to log2
+    }
+
+    // Base output offset for this token+head (dims start here)
+    int out_offset_base = (first_token_pos + token_idx) * OUT_TOKEN_STRIDE +
+                          kv_head_idx * NUM_QO_HEADS_PER_KV * HEAD_DIM +
+                          head_idx * HEAD_DIM +
+                          thread_in_group * VAL_PER_THREAD;
+
+    // Compute all VAL_PER_THREAD dimensions
+    float out_vals[VAL_PER_THREAD];
+#ifdef MPK_MERGE_KV_OUTER
+    // KV outer, dim inner. The running softmax state (m_global, d_global, and
+    // both rescale weights) depends only on kv_idx, but the dim-outer nest
+    // below recomputes all of it -- and reloads the same lse element -- once
+    // per dim. Interchanging hoists it: per kv step this does one lse load and
+    // two exp2 instead of VAL_PER_THREAD of each.
+    //
+    // No float reassociation: each accumulator sees the same operations in the
+    // same order over kv. It is NOT bit-identical in practice, though -- the
+    // generated text hash changes (88861a4763c0 -> 2051938f7067, stable across
+    // runs). Naming `w_prev`/`w_other` once instead of recomputing ptx_exp2 per
+    // dim changes which multiply-adds the backend contracts into v_fma, and a
+    // contracted FMA keeps a wider intermediate than mul-then-add.
+    //
+    // Sized, not assumed: on wikitext-2 (4 x 1024-token slices) the two flags
+    // together move mean NLL by +0.033 +/- 0.008, sign-flipping across slices.
+    // The yardstick is CK_FMHA_NUM_KV_CHUNKS 8->16, which is *exact* in real
+    // arithmetic (same keys, merge is an identity) and so measures pure FP
+    // reordering: it moves NLL by -0.107 +/- 0.012, 2.6x further. This is
+    // inside the decode path's own FP-sensitivity band.
+    //
+    // The redundancy this removes is CSE the compiler cannot do itself,
+    // because the loads sit between the repeated computations and it cannot
+    // prove lse_ptr is unaliased by the stores.
+    //
+    // The o loads also become adjacent within a kv step (o_base + 0..
+    // VAL_PER_THREAD-1) so they merge into one wide load. In the dim-outer
+    // form each lane's o access was 4 B at an 8 B stride -- half of every
+    // cache line fetched and discarded, twice.
+    {
+      float m_global = -inf;
+      float d_global = 1.f;
+      float o_global[VAL_PER_THREAD];
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        o_global[i] = 0.f;
+      }
+#ifdef MPK_MERGE_TWO_PASS
+      // Two-pass form. The running-max version below is a serial chain: step
+      // k's `o` accumulate needs w_prev, which needs m_global from step k-1,
+      // so the 31 chunk loads cannot overlap -- the loop runs at one
+      // load->exp2->fma latency per chunk with the memory system idle.
+      //
+      // Pass 1 reads only the 31 lse values (one dword each, and this thread's
+      // whole set is contiguous in kv) and reduces them to m_max. Pass 2 then
+      // has every weight known up front, so all 31 `o` loads are independent
+      // and issue back-to-back into one long vmcnt queue, and every accumulate
+      // is a plain FMA against a constant weight -- no rescale, no chain.
+      //
+      // Mathematically the standard flash-attention final-merge form: with
+      // m_max fixed, sum_k exp2(m_k - m_max) * o_k over a common base rather
+      // than rescaling a running base. Same result in exact arithmetic and
+      // strictly better conditioned (every weight is <= 1); it differs from
+      // the running form in the low bits for the same FMA-contraction reason
+      // noted above.
+      float lse_log2[NUM_KV_CHUNKS];
+      int const lse_base0 = head_idx +
+                            (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                            lse_kv_offset;
+      // AS(1) for the same reason as the `o` loads below: as generic FLAT
+      // these bump lgkmcnt too, and pass 1 is precisely the part that must
+      // become one deep independent queue -- every value is needed before the
+      // max reduction can finish, and none depends on any other.
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        lse_log2[kv_idx] =
+            *(__attribute__((address_space(1))) float const *)(
+                lse_ptr + lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) *
+            1.44269504088896340736f;
+      }
+#ifdef MPK_MERGE_O_EARLY2
+      // Every chunk's O slice now, behind the LSE loads: one round trip for both.
+      float o_hold[NUM_KV_CHUNKS][VAL_PER_THREAD];
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr + o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr + o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+          o_hold[kv_idx][2] = t.z;
+          o_hold[kv_idx][3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_hold[kv_idx][i] = o_ptr[o_base + i];
+          }
+        }
+      }
+#endif
+      float m_max = -inf;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        m_max = max(m_max, lse_log2[kv_idx]);
+      }
+      MPK_ATS_MRG(11, m_max);
+      float d_sum = 0.f;
+#ifdef MPK_MERGE_O_PRELOAD
+      // Issue every chunk's O load before any FMA so they form one vmcnt
+      // queue. The mixed loop lets the compiler wait per chunk. FMA order
+      // and weights stay kv_idx 0..num_chunks-1.
+      float o_hold[NUM_KV_CHUNKS][VAL_PER_THREAD];
+      float w_hold[NUM_KV_CHUNKS];
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        w_hold[kv_idx] = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w_hold[kv_idx];
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr +
+                                                                     o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr +
+                                                                     o_base);
+          o_hold[kv_idx][0] = t.x;
+          o_hold[kv_idx][1] = t.y;
+          o_hold[kv_idx][2] = t.z;
+          o_hold[kv_idx][3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_hold[kv_idx][i] = o_ptr[o_base + i];
+          }
+        }
+      }
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = w_hold[kv_idx];
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_hold[kv_idx][i] * w;
+        }
+      }
+#elif defined(MPK_MERGE_O_EARLY2)
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_hold[kv_idx][i] * w;
+        }
+      }
+#else
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float const w = ptx_exp2(lse_log2[kv_idx] - m_max);
+        d_sum += w;
+        int const o_base =
+            (lse_base0 + kv_idx * NUM_QO_HEADS_PER_KV) * HEAD_DIM +
+            thread_in_group * VAL_PER_THREAD;
+        // Load this chunk's slice as ONE address-space(1) vector, not
+        // VAL_PER_THREAD scalar dereferences.
+        //
+        // Both halves of this matter, and the second half is the whole point
+        // of the two-pass form.
+        //
+        // A plain `o_ptr[...]` is a *generic* pointer, so clang emits
+        // `flat_load_dwordx2`, and a FLAT load bumps lgkmcnt as well as vmcnt.
+        // The compiler therefore cannot express "wait for chunk k's load but
+        // not chunk k+4's" -- there is no counted wait that covers one counter
+        // and not the other -- so it falls back to full
+        // `s_waitcnt vmcnt(0) lgkmcnt(0)` drains. Verified in the gfx950
+        // disassembly of the shipping build: pass 2 issued its loads in
+        // batches of four separated by full drains, i.e. issue-4, stall,
+        // accumulate, issue-4, ... The 31 loads never formed the single deep
+        // queue this loop was restructured to create, so the two-pass rewrite
+        // was buying nothing over the running-max chain it replaced.
+        //
+        // Through an AS(1) pointer the same access becomes
+        // `global_load_dwordx2`, which touches vmcnt only, and the scheduler
+        // is free to hoist loads and retire them with counted `vmcnt(N)`.
+        //
+        // Bit-identical, deliberately: this changes only how the bytes are
+        // fetched. The floats are the same floats, the FMA order is unchanged,
+        // and no reassociation is introduced -- so it is testable against an
+        // exact hash rather than a perplexity band. (Contrast MERGE_KV_OUTER
+        // and the two-pass form itself, both of which do move the low bits.)
+        //
+        // Alignment is structural, not assumed: o_base's chunk term is a
+        // multiple of HEAD_DIM (64) and its lane term is
+        // thread_in_group * VAL_PER_THREAD, so the offset is a multiple of
+        // VAL_PER_THREAD and the address is naturally aligned for the vector
+        // width. The static_assert below pins the only two widths this
+        // produces (HEAD_DIM/THREADS_PER_TOKEN is 2 or 4 for every shape here);
+        // anything else takes the scalar path rather than misaligning.
+        float o_v[VAL_PER_THREAD];
+        if constexpr (VAL_PER_THREAD == 2) {
+          _mg_f32x2 const t =
+              *(__attribute__((address_space(1))) _mg_f32x2 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+        } else if constexpr (VAL_PER_THREAD == 4) {
+          _mg_f32x4 const t =
+              *(__attribute__((address_space(1))) _mg_f32x4 const *)(o_ptr +
+                                                                     o_base);
+          o_v[0] = t.x;
+          o_v[1] = t.y;
+          o_v[2] = t.z;
+          o_v[3] = t.w;
+        } else {
+#pragma unroll
+          for (int i = 0; i < VAL_PER_THREAD; ++i) {
+            o_v[i] = o_ptr[o_base + i];
+          }
+        }
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] += o_v[i] * w;
+        }
+      }
+#endif
+      MPK_ATS_MRG(12, o_global[0]);
+      m_global = m_max;
+      d_global = d_sum;
+#else
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float m_prev = m_global, d_prev = d_global;
+
+        int lse_linear = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                         lse_kv_offset;
+        int o_base = lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD;
+
+        // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
+        float other_m = lse_ptr[lse_linear] * 1.44269504088896340736f,
+              other_d = 1;
+        m_global = max(m_prev, other_m);
+        float const w_prev = ptx_exp2(m_prev - m_global);
+        float const w_other = ptx_exp2(other_m - m_global);
+        d_global = d_prev * w_prev + other_d * w_other;
+#pragma unroll
+        for (int i = 0; i < VAL_PER_THREAD; ++i) {
+          o_global[i] = o_global[i] * w_prev + o_ptr[o_base + i] * w_other;
+        }
+      }
+#endif
+      float corr = 1.0f;
+      if (sinks_ptr != nullptr) {
+        float lse_log2 = m_global + ptx_log2(d_global);
+        float diff = sink_val_log2 - lse_log2;
+        corr = __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+      }
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        float out_f = __fdividef(o_global[i], d_global);
+        if (sinks_ptr != nullptr) {
+          out_f *= corr;
+        }
+        out_vals[i] = out_f;
+      }
+    }
+#else
+#pragma unroll
+    for (int i = 0; i < VAL_PER_THREAD; ++i) {
+      float m_global = -inf;
+      float d_global = 1.f;
+      float o_global = 0.f;
+#pragma unroll
+      for (int kv_idx = 0; kv_idx < num_chunks; ++kv_idx) {
+        float m_prev = m_global, d_prev = d_global;
+
+        int lse_linear = head_idx + kv_idx * NUM_QO_HEADS_PER_KV +
+                         (first_token_pos + token_idx) * LSE_TOKEN_STRIDE +
+                         lse_kv_offset;
+        int lse_offset = lse_linear;
+        int o_offset =
+            lse_linear * HEAD_DIM + thread_in_group * VAL_PER_THREAD + i;
+
+        // CK FMHA stores LSE in natural log scale; convert to log2 for ptx_exp2
+        float other_m = lse_ptr[lse_offset] * 1.44269504088896340736f,
+              other_d = 1;
+        m_global = max(m_prev, other_m);
+        d_global = d_prev * ptx_exp2(m_prev - m_global) +
+                   other_d * ptx_exp2(other_m - m_global);
+        float other_o = o_ptr[o_offset];
+        o_global = o_global * ptx_exp2(m_prev - m_global) +
+                   other_o * ptx_exp2(other_m - m_global);
+      }
+      float out_f = __fdividef(o_global, d_global);
+      if (sinks_ptr != nullptr) {
+        float lse_log2 = m_global + ptx_log2(d_global);
+        float diff = sink_val_log2 - lse_log2;
+        float correction = __fdividef(1.0f, 1.0f + ptx_exp2(diff));
+        out_f *= correction;
+      }
+      out_vals[i] = out_f;
+    }
+#endif
+
+    // Write output: either write-through (st_wt) or regular global store
+    if constexpr (WRITE_THROUGH) {
+      // Pack pairs of bf16 into uint32 and write-through to HBM
+      static_assert(VAL_PER_THREAD % 2 == 0 || VAL_PER_THREAD == 1,
+                    "WRITE_THROUGH requires even VAL_PER_THREAD or 1");
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; i += 2) {
+        __hip_bfloat16 v0 = (__hip_bfloat16)out_vals[i];
+        __hip_bfloat16 v1 = (__hip_bfloat16)out_vals[i + 1];
+        uint32_t packed;
+        uint16_t lo, hi;
+        memcpy(&lo, &v0, 2);
+        memcpy(&hi, &v1, 2);
+        packed = lo | ((uint32_t)hi << 16);
+#if defined(MPK_REP_ONLY) && defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+        if (!mpk_aid_attnout_live())
+#endif
+#ifdef MPK_VTN_AOQ_INPLACE
+        static_assert(OUT_TOKEN_STRIDE == 4096 && VAL_PER_THREAD == 2,
+                      "MPK_VTN_AOQ_INPLACE: 4096-element rows, one bf16 pair per lane");
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+        if (s_aoq_on == 0) st_wt_u32((void *)&output_ptr[out_offset_base + i], packed); else
+#endif
+        mpk_aoq_inplace((char *)output_ptr, out_offset_base + i, packed);  // MPK_VTN_AOQ_INPLACE
+#else
+        st_wt_u32((void *)&output_ptr[out_offset_base + i], packed);
+#endif
+        MPK_ATS_MRG(13, packed);
+#if defined(MPK_VTN_AOQ) && !defined(MPK_VTN_AOQ_INPLACE)
+        static_assert(OUT_TOKEN_STRIDE == 4096 && VAL_PER_THREAD == 2,
+                      "MPK_VTN_AOQ: 4096-element rows, one bf16 pair per lane");
+#if defined(MPK_VTN_AOQ_ABIP) || defined(MPK_VTN_AOQ_MINN)
+        if (s_aoq_on != 0)
+#endif
+        mpk_aoq_publish(out_offset_base + i, packed);
+#endif
+#if defined(MPK_AID_SPLIT_ATTNOUT) && defined(MPK_AID_SPLIT_FLAGS)
+        // Mirror into both AID replicas so the O-proj reads this slice from
+        // memory homed in its own range. An MTYPE_NC line is never
+        // probe-invalidated, so the consumer's vL1-only `buffer_inv` cannot
+        // evict a stale copy; an AID-local RW line is invalidated by this very
+        // write-through store. Rides the existing store, so the caller's
+        // post-merge vmcnt drain covers it and no new barrier is added.
+        mpk_aid_attnout_publish32((out_offset_base + i) >> 1, packed);
+#endif
+      }
+    } else {
+#pragma unroll
+      for (int i = 0; i < VAL_PER_THREAD; ++i) {
+        output_ptr[out_offset_base + i] = (T)out_vals[i];
+      }
+    }
+  }
+}
+
+} // namespace kernel

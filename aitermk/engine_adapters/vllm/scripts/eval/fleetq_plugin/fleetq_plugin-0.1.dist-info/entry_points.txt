@@ -1,0 +1,3 @@
+[vllm.general_plugins]
+fleetq = fleetq_plugin:register
+

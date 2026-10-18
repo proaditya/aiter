@@ -1,0 +1,6720 @@
+#if defined(MPK_QKV_RED_FAST) && !defined(MPK_QKV_RED_LDS_BAR)
+#error "MPK_QKV_RED_FAST: written for the MPK_QKV_RED_LDS_BAR reduce (4 waves)"
+#endif
+#if defined(MPK_QKV_NQ_FUSED2) && \
+    (defined(MPK_QKV_NQ_FUSED) || !defined(MPK_QKV_LDS_NORM) || \
+     defined(MPK_QKV_KSPLIT_SHARED_NORM) || defined(MPK_QKV_KV_SHARED_ROW))
+#error "MPK_QKV_NQ_FUSED2: LDS-norm path, not with v1 or the s_tok_fp8 copies"
+#endif
+#if defined(MPK_QKV_NQ_FUSED) && !defined(MPK_QKV_LDS_NORM)
+#error "MPK_QKV_NQ_FUSED: the LDS-norm QKV path"
+#endif
+#if defined(MPK_QKV_NQ_FUSED) && \
+    (defined(MPK_QKV_KSPLIT_SHARED_NORM) || defined(MPK_QKV_KV_SHARED_ROW))
+#error "MPK_QKV_NQ_FUSED: these copy s_tok_fp8 out before the ready barrier"
+#endif
+/* Copyright 2025 CMU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// Fused RMSNorm + MXFP4 Gang Linear + Bias for MI300/MI350.
+//
+// Same structure as gang_rmsnorm_linear_bias_mi300.cuh but uses MXFP4 weights
+// with hardware FP4xFP8 MFMA instead of BF16 CK GEMM pipeline.
+//
+// Weight format: MXFP4 packed per workgroup (same layout as MoE kernels):
+//   [n_wgs_per_xcd, wg_bytes] where wg_bytes = OPW*(K/2) + OPW*(K/32)
+//
+// Dispatch: 8 gang tasks (1 per XCD), tiles assigned by tile_idx.
+//   tok_idx = tile_idx / n_wgs_per_xcd
+//   wg_idx  = tile_idx % n_wgs_per_xcd
+//
+// Step 1: Every worker computes RMSNorm redundantly (same as existing kernel).
+// Step 2: Quantize normalized BF16 input to FP8 in LDS.
+// Step 3: Depth-4 pipelined MFMA FP4(weight) x FP8(input).
+// Step 4: Bias epilogue, write BF16 output.
+//
+// Expected speedup: QKV weight 31.5 MB BF16 -> 8.4 MB MXFP4 (3.7x reduction).
+// QKV compute: ~26us -> ~8us per layer.
+
+#pragma once
+#ifndef MPK_MFMA_TAIL_PAD
+#ifdef MPK_MFMA_TAIL_NOP
+// Wait before reading a scaled MFMA's accumulator (threshold measured at 11 wait states on gfx950).
+#define MPK_MFMA_TAIL_STR2(x) #x
+#define MPK_MFMA_TAIL_STR(x) MPK_MFMA_TAIL_STR2(x)
+#define MPK_MFMA_TAIL_PAD "s_nop " MPK_MFMA_TAIL_STR(MPK_MFMA_TAIL_NOP) "\n"
+#else
+#define MPK_MFMA_TAIL_PAD "s_nop 15\n" "s_nop 15\n"
+#endif
+#endif
+#ifndef MPK_TIDX_Q_Q
+#if defined(MPK_TID_FRESH) || defined(MPK_TID_FRESH_Q)
+// threadIdx.x through a volatile v_mov: nothing derived from it can be hoisted out of the
+// persistent loop into kernel-lifetime registers.
+__device__ __forceinline__ unsigned mpk_tid_fresh_Q() {
+  unsigned t;
+  asm volatile("v_mov_b32 %0, %1\n\ts_nop 1" : "=v"(t) : "v"(threadIdx.x));
+  return t;
+}
+#define MPK_TIDX_Q (mpk_tid_fresh_Q())
+#else
+#define MPK_TIDX_Q (threadIdx.x)
+#endif
+#endif
+
+// x_out store. MPK_XOUT_GLOBAL_ST types it AS(1): a generic-pointer store
+// is flat_store_dwordx2, and a pending FLAT access makes every later wait
+// vmcnt(0), splitting the next fold iteration into two round trips.
+#ifdef MPK_XOUT_GLOBAL_ST
+#define MPK_XOUT_STORE(dst, packed)                                           \
+  do {                                                                        \
+    _gl_u32x2 _xo_v;                                                          \
+    _xo_v[0] = (packed).x;                                                    \
+    _xo_v[1] = (packed).y;                                                    \
+    *(__attribute__((address_space(1))) _gl_u32x2 *)(dst) = _xo_v;            \
+  } while (0)
+#else
+#define MPK_XOUT_STORE(dst, packed) __builtin_memcpy((dst), &(packed), 8)
+#endif
+#ifndef MPK_QKVK_MARK
+#define MPK_QKVK_MARK(k) do {} while (0)  // MPK_QKVK_LDS off
+#endif
+// One token per virtual request (MPK_SPEC_VSLOT): the request of a row is that row.
+#if defined(MPK_VT2) && defined(MPK_VT2_QKV) && defined(MPK_SPEC_VSLOT) && defined(MPK_VT2_QPOS)
+#define MPK_QKV_PF_VSLOT 1
+#else
+#define MPK_QKV_PF_VSLOT 0
+#endif
+#include "mpk_atoms.cuh" // st_wt_*, ld_sys_s32 (QKV K-split handshake)
+#include "tasks/mi300/gang_moe_linear_mxfp4_mi300.cuh" // FP4xFP8 type defs + helpers
+#include "tasks/mi300/gang_rmsnorm_linear_bias_mi300.cuh" // RMSNorm prologue
+#include "tasks/mi300/moe_ws_layout.cuh" // MOE_WS_SLOTS, moe_ws_offset()
+#if defined(MPK_WSFC_READ_PRODUCER)
+#define MPK_WSLP_SLOT(s) ((s) + MOE_WS_SLOTS * ((s) >> 1))
+#elif defined(MPK_QKV_WS_LOCAL_PROBE)
+// TIMING ONLY: fold this AID's two ring slots twice (all local reads).
+#define MPK_WSLP_SLOT(s) \
+  (((s) & 1) + ((int)((kernel::mpk_prenorm_xcc() & 0x7) >> 2) << 1))
+#else
+#define MPK_WSLP_SLOT(s) (s)
+#endif
+
+namespace kernel {
+// MPK_PRENORM_AID reads the physical XCD where xcd_id is not in scope.
+__device__ __forceinline__ unsigned mpk_prenorm_xcc() {
+  unsigned x;
+  MPK_GET_XCC_ID32(x);
+  return x;
+}
+
+
+// Native vector types for address-space-qualified loads. HIP's float4/uint2 are
+// class templates (HIP_vector_type), so they cannot be copy-constructed through
+// an AS(1) pointer, and __builtin_memcpy is declared __host__ and rejects one
+// outright. These ext_vector_types can, which is what lets the ResAdd prologue
+// issue GLOBAL rather than generic FLAT loads -- see the comment at its use.
+typedef float _gl_f32x4 __attribute__((ext_vector_type(4)));
+#ifdef MPK_WS_FARCOPY
+// MPK_WSFC_V2 slow path: a slot of this AID's copy is still poisoned (its
+// far copy has not landed). Re-read all four slots past L2 from their
+// producer copies (slot s lives in copy s >> 1, never poisoned), in one
+// round -- the baseline fold's cost. Same slot order: bit-exact.
+__device__ __noinline__ float4 mpk_ws_farcopy_fold(float const *own,
+                                                   float const *prim0,
+                                                   int h, int off) {
+  (void)own;
+  static_assert(MOE_WS_SLOTS == 4, "four-slot fold");
+#ifdef MPK_WSFC_STATS
+  mpk_wsfc_stat(0, off);
+#endif
+  float4 v0, v1, v2, v3;
+  mpk_fc_ld16x4(prim0 + 0 * h + off, prim0 + 1 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 2 * h + off,
+                prim0 + MOE_WS_SLOTS * h + 3 * h + off, v0, v1, v2, v3);
+  v0.x += v1.x;
+  v0.y += v1.y;
+  v0.z += v1.z;
+  v0.w += v1.w;
+  v0.x += v2.x;
+  v0.y += v2.y;
+  v0.z += v2.z;
+  v0.w += v2.w;
+  v0.x += v3.x;
+  v0.y += v3.y;
+  v0.z += v3.z;
+  v0.w += v3.w;
+  return v0;
+}
+#endif
+#ifdef MPK_WS_SYS_LOAD
+// sc0 sc1 buffer load: bypasses L1 and L2 without allocating, so the
+// workspace W2 rewrote from another XCD is never served from a stale
+// line and none is left behind for the next layer.
+__device__ __forceinline__ _gl_f32x4 mpk_ws_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                   int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b128(rs, elem * 4, 0, 17);
+  return _gl_f32x4{__builtin_bit_cast(float, v[0]), __builtin_bit_cast(float, v[1]),
+                   __builtin_bit_cast(float, v[2]), __builtin_bit_cast(float, v[3])};
+}
+#endif
+typedef unsigned int _gl_u32x2 __attribute__((ext_vector_type(2)));
+#ifdef MPK_WS_SYS_LOAD
+// A __noinline__ callee receives its pointers in VGPRs, and a buffer op
+// needs an SGPR descriptor, so without this every load gets a waterfall.
+__device__ __forceinline__ void *mpk_uniform_ptr(void *p) {
+  unsigned long long const a = (unsigned long long)p;
+  unsigned const lo = __builtin_amdgcn_readfirstlane((unsigned)a);
+  unsigned const hi = __builtin_amdgcn_readfirstlane((unsigned)(a >> 32));
+  return (void *)(((unsigned long long)hi << 32) | lo);
+}
+__device__ __forceinline__ _gl_u32x2 mpk_res_sys_ld(__amdgpu_buffer_rsrc_t rs,
+                                                    int elem) {
+  auto const v = __builtin_amdgcn_raw_buffer_load_b64(rs, elem * 2, 0, 17);
+  return _gl_u32x2{v[0], v[1]};
+}
+#endif
+
+// ── Shared QKV weight-tile LDS geometry ──────────────────────────────────
+//
+// The DMA below writes where these say and the MFMA in the kvupd kernel reads
+// where these say. They were previously spelled out once, inline; they are now
+// shared with the fused layer's Phase 9 prefetch, which stages the NEXT
+// layer's weights into the same region during the layer-barrier spin. A
+// mismatch between the two callers is silent wrong numerics, so both derive
+// every offset from these functions and neither open-codes any of it.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+struct QkvWeightLds {
+  static constexpr int NUM_WAVES = 4;
+  static constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  static constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  static constexpr int WG_BYTES = WG_DATA_BYTES + OUTPUT_PER_WG * NUM_BLOCKS_32;
+
+  static constexpr int MFMA_N = 16;
+  static constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  static constexpr int MFMA_ITERS = REDUCTION_SIZE / 128;
+  static constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  static constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  static constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  static constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
+
+  static constexpr int TILE_ROWS = 16;
+  static constexpr int TILE_DATA = TILE_ROWS * (REDUCTION_SIZE / 2);
+  static constexpr int TILE_SCALE = TILE_ROWS * NUM_BLOCKS_32;
+  static constexpr int N16_DATA = TILE_DATA / 16;
+  static constexpr int LPT = (N16_DATA + 255) / 256;
+  static constexpr int TILE_DATA_PADDED = LPT * 256 * 16;
+#ifdef MPK_QKV_PREFETCH_SCALES
+  // buffer_load_lds advances the LDS pointer in 1 KiB wave chunks, so a scale
+  // region that is DMA'd rather than scattered has to be a whole number of
+  // them. Costs (pad - TILE_SCALE) bytes of LDS per tile and buys the removal
+  // of the VGPR round trip in Phase B.
+  static constexpr int TILE_SCALE_PADDED = ((TILE_SCALE + 1023) / 1024) * 1024;
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE_PADDED;
+#else
+  static constexpr int TILE_BYTES = TILE_DATA_PADDED + TILE_SCALE;
+#endif
+
+  // ── Low LDS: reduction scratch, normalized activation, token staging ───
+  //
+  // Default layout keeps the historical aliasing: the RMSNorm cross-wave
+  // reduction scratch and the FP8 token region both start at byte 0, which is
+  // safe only because the reduction has finished by the time the quantizer
+  // writes. RED_OFF/TOK_OFF name that overlap instead of leaving it implicit.
+  //
+  // MPK_QKV_LDS_NORM gives the normalized bf16 row its own LDS block between
+  // them. Step 1 computes the norm redundantly in *every* block and writes it
+  // to a global scratch that Step 2 in the *same* block reads straight back,
+  // so the round trip carries no information between workgroups -- it is a
+  // write and a read of TOK_ROWS * REDUCTION_SIZE * 2 bytes per block per
+  // layer that LDS can absorb. The reduction scratch has to stay disjoint
+  // from the norm block (the batch loop reuses s_red for row b after writing
+  // norm row b-1), which is why this is a third region and not an alias.
+  static constexpr int RED_OFF = 0;
+  static constexpr int RED_BYTES = ((NUM_WAVES * 4 + 15) / 16) * 16;
+#ifdef MPK_QKV_LDS_NORM
+  static constexpr int NORM_OFF = RED_BYTES;
+  static constexpr int NORM_BYTES = TOK_ROWS * REDUCTION_SIZE * 2;
+  static constexpr int TOK_OFF = ((NORM_OFF + NORM_BYTES + 15) / 16) * 16;
+#else
+  static constexpr int NORM_OFF = 0;
+  static constexpr int NORM_BYTES = 0;
+  static constexpr int TOK_OFF = 0;
+#endif
+
+  // Weight region base within the task's dynamic LDS.
+#ifdef MPK_QKV_W_TOP
+  // Weights at the top of LDS, below the layer-index word; the staging that sits
+  // above them in the default layout (X_OFF..X_END) takes the low gap instead.
+  static constexpr int W_LOW = ((TOK_OFF + TOK_REGION + SC_REGION + 15) / 16) * 16;
+  static constexpr int W_OFF =
+      ((mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END - TILE_BYTES * NUM_WAVES) /
+       16) *
+      16;
+  static_assert(W_OFF >= W_LOW, "MPK_QKV_W_TOP: weights would overlap the token region");
+  static constexpr int X_OFF = W_LOW;
+  static constexpr int X_END = W_OFF;
+#else
+  static constexpr int W_OFF =
+      ((TOK_OFF + TOK_REGION + SC_REGION + 15) / 16) * 16;
+#endif
+  // Total LDS the weight staging occupies, from the base of _rnlm_smem.
+  static constexpr int W_END = W_OFF + TILE_BYTES * NUM_WAVES;
+};
+
+#ifdef MPK_QKV_W_TOP
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_LDS_POISON_HI) || \
+    (defined(MPK_QKV_GAMMA_LDS) && !defined(MPK_QKV_GAMMA_NORMREG))
+#error "MPK_QKV_W_TOP moves only the slab staging; these flags stage above G::W_END too"
+#endif
+#endif
+
+#ifdef MPK_QKV_B_MASK
+#if defined(MPK_QKV_TSC_PTR_INCREMENT) || defined(MPK_QKV_DS_BEFORE_ADDR) || \
+    defined(MPK_QKV_MFMA_UNROLLED) || !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_B_MASK is wired for the PF_BEFORE_WAIT loop"
+#endif
+// Batch 1: only lanes (g, col == 0) feed a real column of the MFMA's B
+// operand, so the activation stripes and their scale are read by those four
+// lanes alone. Columns 1..15 then hold stale registers; every epilogue
+// discards them.
+#define MPK_QKV_B_MASK_ON                                                      \
+  "s_mov_b64 %[bsv], exec\n"                                                  \
+  "s_mov_b32 exec_lo, 0x10001\n"                                              \
+  "s_mov_b32 exec_hi, 0x10001\n"
+#define MPK_QKV_B_MASK_OFF "s_mov_b64 exec, %[bsv]\n"
+#endif
+
+#ifdef MPK_QKV_KSPLIT
+// 2-way K-split scratch: k_part 0 writes its 4 AccVGPR floats per thread,
+// k_part 1 adds them and runs the RoPE/KV epilogue. 8 XCDs × 32 tiles is
+// the most the 31-worker geometry can ever ask for (10 tiles/XCD today).
+constexpr int MPK_QKV_KSPLIT_MAX_TILE = 32;
+__device__ float g_qkv_kpart_acc[8 * MPK_QKV_KSPLIT_MAX_TILE * 256 * 4];
+__device__ int g_qkv_kpart_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+// Quantized token row (fp8 + scales) published by k_part 0 so k_part 1
+// can skip RMSNorm. 3072 B covers TOK_REGION+SC_REGION at H=2944 (2984 B).
+constexpr int MPK_QKV_KSPLIT_TOK_BYTES = 3072;
+__device__ uint8_t
+    g_qkv_kpart_tok[8 * MPK_QKV_KSPLIT_MAX_TILE * MPK_QKV_KSPLIT_TOK_BYTES];
+__device__ int g_qkv_kpart_tok_ready[8 * MPK_QKV_KSPLIT_MAX_TILE];
+#endif
+#endif
+
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+// Quantized token row (fp8 + scales) published by Q tile 0 for this XCD's
+// K/V tiles; two parity slots per XCD, flag = qkv epoch (64 B apart).
+// MPK_VTN_QROW: published by the rank running token 3's tile 0 for token 3's other tiles.
+constexpr int MPK_QKV_KV_ROW_BYTES = 3072;
+__device__ uint8_t g_qkv_kv_row[8 * 2 * MPK_QKV_KV_ROW_BYTES];
+__device__ int g_qkv_kv_row_epoch[8 * 2 * 16];
+#endif
+#ifdef MPK_VTN_QROW_TAG
+#ifndef MPK_VTN_QROW
+#error "MPK_VTN_QROW_TAG needs MPK_VTN_QROW"
+#endif
+// MPK_VTN_QROW_TAG: tagged-row slots in the AID flag replica, per die (4 per AID) and parity; free gap between the
+// 4-row O-proj output replica (ends 71424) and the router die sums (98304).
+#if defined(MPK_VTN_T) && MPK_VTN_T > 4
+// MPK_VTN_T6: past the MPK_VTN_T-row O-proj output replica, which reaches 73728 above 4 rows.
+constexpr int MPK_AID_QROW_BASE_INTS = 81920;
+static_assert(MPK_AID_QROW_BASE_INTS >= MPK_AID_OUT_BASE_INTS + MPK_VTN_T * 2944 / 2,
+              "MPK_VTN_T6: QROW slots past the O-proj output replica");
+#else
+constexpr int MPK_AID_QROW_BASE_INTS = 73728;
+#endif
+constexpr int MPK_AID_QROW_SLOT_INTS = 1536;
+static_assert(MPK_AID_QROW_BASE_INTS >= MPK_AID_OUT_BASE_INTS + 4 * 2944 / 2 &&
+                  MPK_AID_QROW_BASE_INTS + 8 * MPK_AID_QROW_SLOT_INTS <= MPK_AID_ROP_AGG_BASE_INTS,
+              "MPK_VTN_QROW_TAG slots between the O-proj output replica and the router die sums");
+#endif
+#ifdef MPK_VTN_QROW
+#define MPK_QROW_TAKE (kv_row_epoch > 0 && qrow_role == 2)
+#define MPK_QROW_GIVE (kv_row_epoch > 0 && qrow_role == 1)
+#else
+#define MPK_QROW_TAKE (kv_row_epoch > 0 && wg_idx >= NUM_Q_PER_KV)
+#define MPK_QROW_GIVE (kv_row_epoch > 0 && wg_idx == 0)
+#endif
+
+// Issue the HBM->LDS weight DMA for one QKV tile. Does NOT wait: the caller
+// drains with `s_waitcnt vmcnt(0)` once it has something else to do first.
+// `tile_idx` selects the weight group exactly as the kvupd kernel does, so a
+// worker prefetching for the next layer must pass the tile index it will
+// itself execute there (xcd_rank is stable across layers).
+//
+// `k_iter0` / `k_niters` select a K-range inside the tile (one MFMA iter =
+// 64 B of packed FP4 per row). k_niters < 0 means the full K, which is the
+// non-split default.
+// A prefetch can be split by LDS destination: [LO, HI) keeps the 1 KiB wave chunks
+// whose first byte lies in that range. The default range keeps everything.
+template <int LO, int HI>
+__device__ __forceinline__ bool mpk_pf_keep(int chunk_off) {
+  if constexpr (LO > 0 || HI < (1 << 30)) {
+    int const u = __builtin_amdgcn_readfirstlane(chunk_off);
+    return u >= LO && u < HI;
+  } else {
+    return true;
+  }
+}
+
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE, int AUX = 3,
+          int LDS_LO = 0, int LDS_HI = (1 << 30)>
+__device__ __forceinline__ void qkv_prefetch_weights_lds(void const *weight_ptr,
+                                                         int n_wgs_per_xcd,
+                                                         int tile_idx,
+                                                         int k_iter0 = 0,
+                                                         int k_niters = -1,
+                                                         int stripe = -1) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  extern __shared__ char _rnlm_smem[];
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  // Which wave's 1 KiB stripes to issue; by default the caller's own.
+  int const sw = stripe >= 0 ? stripe : warp_id;
+  int const stid = sw * 64 + (tid & 63);
+  int const wg_idx = tile_idx % n_wgs_per_xcd;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  i32x4_t rsrc = make_w_buffer_rsrc(
+      W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t wg_voff = static_cast<uint32_t>(wg_idx) * G::WG_BYTES;
+
+#ifdef MPK_LDS_DST_S
+  int sws;
+  asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(sws) : "v"(sw));
+#else
+  int const sws = sw;
+#endif
+  auto *lds_warp_base =
+      (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
+                                                     G::W_OFF +
+                                                     sws * 1024);
+  constexpr int ROW_BYTES = REDUCTION_SIZE / 2;
+  int const k_byte0 = k_iter0 * 64;
+  int const k_byte1 = k_niters < 0 ? ROW_BYTES : (k_iter0 + k_niters) * 64;
+  // Scales stay full-tile: they are 16 rows × (K/32) and each K-iter's 4 B
+  // is strided per row, so a linear [k_sc0, k_sc1) skip would drop the wrong
+  // bytes. TILE_SCALE is 1.5 KB; loading it twice is cheaper than being wrong.
+#pragma unroll
+  for (int t = 0; t < G::NUM_WAVES; t++) {
+#pragma unroll
+    for (int j = 0; j < G::LPT; j++) {
+      if (!mpk_pf_keep<LDS_LO, LDS_HI>(G::W_OFF + sw * 1024 + t * G::TILE_BYTES +
+                                       j * 4096)) {
+        continue;
+      }
+      int idx = stid + j * 256;
+      int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+      int const off_in_row = (clamped * 16) % ROW_BYTES;
+      if (off_in_row < k_byte0 || off_in_row >= k_byte1) {
+        continue;
+      }
+      uint32_t voff =
+          wg_voff +
+          static_cast<uint32_t>(t * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
+          static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + j * 4096);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, AUX);
+    }
+#ifdef MPK_QKV_PREFETCH_SCALES
+    // Stage this tile's block scales straight to LDS as well, so Phase B has
+    // nothing left to do but drain. The default path instead reads the scales
+    // into VGPRs after the data drain and scatters them, which costs a second
+    // HBM round trip serialized behind the first. Only waves 0-1 participate:
+    // TILE_SCALE is 16*NUM_BLOCKS_32 bytes, well under the 2 KiB two waves
+    // move, and every lane past that would just re-fetch the clamped tail.
+    if (sw < 2 &&
+        mpk_pf_keep<LDS_LO, LDS_HI>(G::W_OFF + sw * 1024 + t * G::TILE_BYTES +
+                                    G::TILE_DATA_PADDED)) {
+      constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
+      int const vector = sw * 64 + (tid & 63);
+      int const clamped = vector < SCALE_VECTORS ? vector : SCALE_VECTORS - 1;
+      uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
+                      static_cast<uint32_t>(t * G::TILE_SCALE) +
+                      static_cast<uint32_t>(clamped * 16);
+      auto *lds_dst =
+          (__attribute__((address_space(3)))
+           uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                           lds_warp_base +
+                       t * G::TILE_BYTES + G::TILE_DATA_PADDED);
+      __llvm_amdgcn_raw_buffer_load_lds(
+          rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, AUX);
+    }
+#endif
+  }
+}
+
+// MPK_QKV_KV_L2WARM: pull one QKV workgroup record (weights + scales) into L2
+// with plain loads, so a later qkv_prefetch_weights_lds<..., /*AUX=*/0> hits
+// L2. Waits for its own loads before returning (one dummy destination).
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE>
+__device__ __forceinline__ void qkv_warm_weights_l2(void const *weight_ptr,
+                                                    int n_wgs_per_xcd,
+                                                    int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  static_assert(G::WG_BYTES <= 25 * 4096,
+                "qkv_warm_weights_l2 covers 25 x 4 KiB per record");
+  int const wg_idx = tile_idx % n_wgs_per_xcd;
+  // The resource spans the one record, so the last step's overhang past it
+  // reads zeros instead of touching whatever follows.
+  i32x4_t const rsrc = make_w_buffer_rsrc(
+      (uint8_t const *)weight_ptr +
+          static_cast<size_t>(wg_idx) * G::WG_BYTES,
+      static_cast<uint32_t>(G::WG_BYTES));
+  uint32_t voff = static_cast<uint32_t>(MPK_TIDX_Q) * 16u;
+  unsigned sink;
+  // The resource's SGPRs were just written by v_readfirstlane: a VALU SGPR
+  // write needs 5 wait states before a VMEM instruction reads it, and the
+  // compiler does not insert them in front of inline asm.
+  asm volatile("s_nop 4\n"
+               "buffer_load_dword %[d], %[v], %[r], 0 offen\n"
+               ".rept 24\n"
+               "v_add_u32_e32 %[v], 0x1000, %[v]\n"
+               "buffer_load_dword %[d], %[v], %[r], 0 offen\n"
+               ".endr\n"
+               "s_waitcnt vmcnt(0)"
+               : [d] "=&v"(sink), [v] "+v"(voff)
+               : [r] "s"(rsrc)
+               : "memory");
+}
+
+// MPK_KV_SPREAD: stage the 16-row K or V block that Q tile q carries as its
+// second MFMA chain into LDS slot NUM_WAVES, right after its four wave tiles.
+// Tile q takes block (q & 3) of tile NUM_Q_PER_KV + (q >> 2): K for q < 4, V
+// for q >= 4. Same stripe layout and scale placement as the four-tile DMA
+// above (MPK_QKV_PREFETCH_SCALES), so the MFMA addresses it the same way.
+// Does NOT wait.
+template <int BATCH_SIZE, int OUTPUT_PER_WG, int REDUCTION_SIZE,
+          int NUM_Q_PER_KV>
+__device__ __forceinline__ void qkv_prefetch_kv_extra_lds(
+    void const *weight_ptr, int n_wgs_per_xcd, int tile_idx) {
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+  extern __shared__ char _rnlm_smem[];
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const q = tile_idx % n_wgs_per_xcd;
+  int const src_wg = NUM_Q_PER_KV + (q >> 2);
+  int const src_blk = q & 3;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  i32x4_t rsrc = make_w_buffer_rsrc(
+      W, static_cast<uint32_t>(n_wgs_per_xcd) * G::WG_BYTES);
+  uint32_t const wg_voff = static_cast<uint32_t>(src_wg) * G::WG_BYTES;
+  auto *lds_warp_base =
+      (__attribute__((address_space(3))) uint32_t *)((uint8_t *)_rnlm_smem +
+                                                     G::W_END +
+                                                     warp_id * 1024);
+#pragma unroll
+  for (int j = 0; j < G::LPT; j++) {
+    int idx = tid + j * 256;
+    int clamped = idx < G::N16_DATA ? idx : G::N16_DATA - 1;
+    uint32_t voff =
+        wg_voff +
+        static_cast<uint32_t>(src_blk * G::TILE_ROWS * (REDUCTION_SIZE / 2)) +
+        static_cast<uint32_t>(clamped * 16);
+    auto *lds_dst = (__attribute__((address_space(3)))
+                     uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                                     lds_warp_base +
+                                 j * 4096);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+  }
+  if (warp_id < 2) {
+    constexpr int SCALE_VECTORS = (G::TILE_SCALE + 15) / 16;
+    int const clamped = tid < SCALE_VECTORS ? tid : SCALE_VECTORS - 1;
+    uint32_t voff = wg_voff + static_cast<uint32_t>(G::WG_DATA_BYTES) +
+                    static_cast<uint32_t>(src_blk * G::TILE_SCALE) +
+                    static_cast<uint32_t>(clamped * 16);
+    auto *lds_dst = (__attribute__((address_space(3)))
+                     uint32_t *)((uint8_t __attribute__((address_space(3))) *)
+                                     lds_warp_base +
+                                 G::TILE_DATA_PADDED);
+    __llvm_amdgcn_raw_buffer_load_lds(
+        rsrc, lds_dst, 16, static_cast<int>(voff), 0, 0, 3);
+  }
+}
+
+// Fused RMSNorm + MXFP4 Gang Linear + Bias.
+//
+// Template params:
+//   BATCH_SIZE       - max batch size (usually 1 for decode)
+//   OUTPUT_PER_WG    - output rows per workgroup (e.g. 64)
+//   REDUCTION_SIZE   - input/reduction dimension (e.g. 3072)
+//   ACTUAL_HIDDEN_DIM - unpadded hidden size for RMSNorm denominator (e.g.
+//   2880)
+//
+// Runtime params:
+//   tile_idx          - gang task tile index (0..total_tiles_per_xcd-1)
+//   n_wgs_per_xcd     - number of workgroups per XCD
+//   output_stride      - full output stride (for row indexing)
+//   num_active_tokens  - actual number of active tokens
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE>
+__device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kernel(
+    void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
+    void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
+    void *norm_output_ptr,       // [batch, REDUCTION_SIZE] bf16 scratch
+    void const *weight_ptr,      // [n_wgs_per_xcd, wg_bytes] packed MXFP4
+    void const *bias_ptr,        // [1, output_size_per_xcd] bf16 (partitioned)
+    void *output_ptr,            // [batch, output_stride] bf16 (partitioned)
+    int num_active_tokens,
+    int n_wgs_per_xcd,
+    int output_stride,
+    int tile_idx) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0,
+                "OUTPUT_PER_WG must be multiple of 16");
+  static_assert(REDUCTION_SIZE % 128 == 0,
+                "REDUCTION_SIZE must be multiple of 128 for FP4 MFMA");
+
+  // ── Weight layout constants ─────────────────────────────────────────────
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+
+  // ── MFMA constants ─────────────────────────────────────────────────────
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  static_assert(MFMA_ITERS >= 4,
+                "Depth-4 pipeline requires REDUCTION_SIZE >= 512");
+  constexpr int BF16_MFMA_ITERS = REDUCTION_SIZE / 32;
+
+  // ── Wave tiling ─────────────────────────────────────────────────────────
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+
+  // ── Token activation in shared memory ────────────────────────────────────
+  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+  unsigned short *d_output = (unsigned short *)output_ptr;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 1: Redundant RMSNorm ───────────────────────────────────────────
+  // All workers compute the same RMSNorm and write to norm_output_ptr.
+  // For bs>1, loop over active tokens.
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+  for (int b = 0; b < batch_count; b++) {
+    unsigned short const *row_in =
+        (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
+    unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
+        (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
+    gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Tile dispatch ───────────────────────────────────────────────────────
+  int tok_idx = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+
+  if (tok_idx >= batch_count) {
+    return;
+  }
+
+  // Workgroup weight pointers
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Step 2: Quantize BF16 normalized input -> FP4/FP8 in LDS ────────────
+  unsigned short const *input_row =
+      #ifdef MPK_PRENORM_AID
+      #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+      (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+      #undef PRENORM_AID_OFF
+      #else
+      (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+      #endif
+
+  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+      input_row, s_tok_fp8, s_tok_scales);
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t2 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 3: MFMA FP4(weights) x FP4/FP8/BF16(tokens) ──────────────────
+  if constexpr (OUTPUT_PER_WG >= 64) {
+    // N-parallel: 4 waves handle different output rows (depth-4 pipeline)
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+      int wave_tile = warp_id + tile_iter * NUM_WAVES;
+      int w_row = wave_tile * 16 + col;
+
+      int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+      int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+      f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      // Pre-fill: load k-tiles 0..3 into pipeline slots
+      i32x8_t a0 =
+          *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+      int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+      i32x8_t a1 =
+          *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+      int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+      i32x8_t a2 =
+          *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+      int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+      i32x8_t a3 =
+          *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+      int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+#pragma unroll 1
+      for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+        // Slot 0: compute k-tile ki, prefetch ki+4
+        {
+          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki];
+          acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+        }
+        if (ki + 4 < MFMA_ITERS) {
+          int kt4 = (ki + 4) * K_PER_MFMA;
+          a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+          sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+        }
+
+        // Slot 1: compute k-tile ki+1, prefetch ki+5
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 1];
+          acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+        }
+        if (ki + 5 < MFMA_ITERS) {
+          int kt5 = (ki + 5) * K_PER_MFMA;
+          a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+          sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+        }
+
+        // Slot 2: compute k-tile ki+2, prefetch ki+6
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 2];
+          acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+        }
+        if (ki + 6 < MFMA_ITERS) {
+          int kt6 = (ki + 6) * K_PER_MFMA;
+          a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+          sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+        }
+
+        // Slot 3: compute k-tile ki+3, prefetch ki+7
+        if (ki + 3 < MFMA_ITERS) {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 3];
+          acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+        }
+        if (ki + 7 < MFMA_ITERS) {
+          int kt7 = (ki + 7) * K_PER_MFMA;
+          a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+          sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+        }
+      }
+
+      // ── Step 4: Bias epilogue, write BF16 output ─────────────────────────
+      if (col == 0) {
+        for (int i = 0; i < 4; i++) {
+          int out_n = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
+          float sum = acc[i];
+
+          // Add bias (partitioned per XCD)
+          unsigned bt = (unsigned)d_bias[out_n] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+
+          int out_idx = tok_idx * output_stride + out_n;
+          d_output[out_idx] = _gang_float_to_bf16(sum + bv);
+        }
+      }
+    }
+  } else {
+    // K-parallel: 4 waves all process same 16 rows, split K across waves.
+    // Depth-4 pipelined: 4 weight K-tiles pre-loaded, compute overlaps with
+    // prefetch of next 4. Each MFMA ~32 cycles; 4 in flight = ~128 cycles
+    // of latency hiding.
+    constexpr int TOTAL_K_ITERS = MFMA_ITERS;
+    constexpr int ITERS_PER_WAVE = TOTAL_K_ITERS / NUM_WAVES;
+    static_assert(TOTAL_K_ITERS % NUM_WAVES == 0,
+                  "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
+    static_assert(ITERS_PER_WAVE >= 4,
+                  "Depth-4 K-parallel requires ITERS_PER_WAVE >= 4");
+
+    int const ki_start = warp_id * ITERS_PER_WAVE;
+    int const ki_end = ki_start + ITERS_PER_WAVE;
+
+    int w_row = col; // All 4 waves process same 16 output rows
+    int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Pre-fill: load k-tiles 0..3 into pipeline slots
+    i32x8_t a0 =
+        *(i32x8_t const *)(wg_data + row_data_base + ki_start * 64 + g * 16);
+    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
+    i32x8_t a1 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 1) * 64 + g * 16);
+    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
+    i32x8_t a2 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 2) * 64 + g * 16);
+    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
+    i32x8_t a3 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 3) * 64 + g * 16);
+    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+
+// IMPORTANT: #pragma unroll 1 prevents ROCm miscompilation.
+#pragma unroll 1
+    for (int ki = ki_start; ki < ki_end; ki += 4) {
+      // Slot 0: compute k-tile ki, prefetch ki+4
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki];
+        acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+      }
+      if (ki + 4 < ki_end) {
+        int kt4 = (ki + 4) * K_PER_MFMA;
+        a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      }
+
+      // Slot 1: compute k-tile ki+1, prefetch ki+5
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 1];
+        acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+      }
+      if (ki + 5 < ki_end) {
+        int kt5 = (ki + 5) * K_PER_MFMA;
+        a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      }
+
+      // Slot 2: compute k-tile ki+2, prefetch ki+6
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 2];
+        acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+      }
+      if (ki + 6 < ki_end) {
+        int kt6 = (ki + 6) * K_PER_MFMA;
+        a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      }
+
+      // Slot 3: compute k-tile ki+3, prefetch ki+7
+      if (ki + 3 < ki_end) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 3];
+        acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+      }
+      if (ki + 7 < ki_end) {
+        int kt7 = (ki + 7) * K_PER_MFMA;
+        a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      }
+    }
+
+    // Cross-wave LDS reduction (reuse token scratch area, dead after MFMA)
+    float *lds_reduce = (float *)_rnlm_smem;
+    if (col == 0) {
+      for (int i = 0; i < 4; i++) {
+        lds_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+
+    // Wave 0 reduces across waves and writes output with bias
+    if (warp_id == 0 && col == 0) {
+      for (int i = 0; i < 4; i++) {
+        float v = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          v += lds_reduce[w * OUTPUT_PER_WG + g * 4 + i];
+        }
+
+        int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
+
+        unsigned bt = (unsigned)d_bias[out_n] << 16;
+        float bv;
+        __builtin_memcpy(&bv, &bt, 4);
+
+        int out_idx = tok_idx * output_stride + out_n;
+        d_output[out_idx] = _gang_float_to_bf16(v + bv);
+      }
+    }
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+    // Slot 0: QKV. [1]=RMSNorm [2]=FP8Quant [3]=MFMA+Epi
+    atomicAdd(&g_subphase_ns[0][1], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[0][2], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[0][3], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_cnt[0], 1ULL);
+  }
+#endif
+  __syncthreads();
+}
+
+// Fused MulSumAdd + RMSNorm + MXFP4 Gang Linear + Bias.
+//
+// Merges the standalone MulSumAdd task into the QKV kernel's prologue:
+//   Step 0: x_output = residual + sum_k(mlp_out[k] * routing_weight[k])
+//   Step 1: RMSNorm(x_output) → norm_scratch
+//   Steps 2-4: FP8 quantize → MFMA → bias epilogue (unchanged)
+//
+// Eliminates one task dispatch + two scheduling gaps (~10 µs/layer).
+// Used for layers 1+ where a preceding MoE block provides mlp_out.
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE,
+          int NUM_TOPK = 4,
+          int INPUT_STRIDE = REDUCTION_SIZE>
+__device__ __noinline__ void gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel(
+    void const *mlp_out_ptr,        // [batch, topk, INPUT_STRIDE] bf16
+    void const *routing_weight_ptr, // [batch, topk] f32
+    void const *residual_ptr,       // [batch, REDUCTION_SIZE] bf16
+    void const *norm_weight_ptr,    // [REDUCTION_SIZE] bf16
+    void *norm_scratch_ptr, // [batch, REDUCTION_SIZE] bf16 (RMSNorm scratch)
+    void const *weight_ptr, // [n_wgs_per_xcd, wg_bytes] packed MXFP4
+    void const *bias_ptr,   // [1, output_size_per_xcd] bf16 (partitioned)
+    void *x_output_ptr,     // [batch, REDUCTION_SIZE] bf16 (MulSumAdd result)
+    void *qkv_output_ptr,   // [batch, output_stride] bf16 (partitioned)
+    int num_active_tokens,
+    int n_wgs_per_xcd,
+    int output_stride,
+    int tile_idx) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0,
+                "OUTPUT_PER_WG must be multiple of 16");
+  static_assert(REDUCTION_SIZE % 128 == 0,
+                "REDUCTION_SIZE must be multiple of 128 for FP4 MFMA");
+
+  // ── Weight layout constants ─────────────────────────────────────────────
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+
+  // ── MFMA constants ─────────────────────────────────────────────────────
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  static_assert(MFMA_ITERS >= 4,
+                "Depth-4 pipeline requires REDUCTION_SIZE >= 512");
+  constexpr int BF16_MFMA_ITERS = REDUCTION_SIZE / 32;
+
+  // ── Wave tiling ─────────────────────────────────────────────────────────
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+
+  // ── Token activation in shared memory ────────────────────────────────────
+  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+  unsigned short *d_qkv_output = (unsigned short *)qkv_output_ptr;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
+                     _sp_t3b = 0, _sp_t4 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+
+  // ── Step 0+1 FUSED: MulSumAdd + RMSNorm ─────────────────────────────
+  // Pass 1: weighted-sum + residual-add + SSQ accumulation (one loop).
+  //         Uses inline-asm v_fmac to keep SSQ in the inner loop body
+  //         (without this the compiler hoists SSQ into a separate pass).
+  // Pass 2: apply norm weight, vectorized 4×bf16 loads/stores.
+  {
+    unsigned short const *d_mlp_out = (unsigned short const *)mlp_out_ptr;
+    float const *d_rw = (float const *)routing_weight_ptr;
+    unsigned short const *d_residual = (unsigned short const *)residual_ptr;
+    unsigned short *d_x_out = (unsigned short *)x_output_ptr;
+    unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
+    unsigned short *d_norm_out = (unsigned short *)norm_scratch_ptr;
+
+    for (int b = 0; b < batch_count; b++) {
+      // Load routing weights for this token
+      float rw[NUM_TOPK];
+#pragma unroll
+      for (int k = 0; k < NUM_TOPK; k++) {
+        rw[k] = d_rw[b * NUM_TOPK + k];
+      }
+
+      // Pass 1: Fused weighted-sum + residual-add + SSQ accumulation
+      float ssq = 0.0f;
+      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+        unsigned r_bits = (unsigned)d_residual[b * REDUCTION_SIZE + i] << 16;
+        float sum;
+        __builtin_memcpy(&sum, &r_bits, 4);
+
+#pragma unroll
+        for (int k = 0; k < NUM_TOPK; k++) {
+          unsigned v_bits =
+              (unsigned)
+                  d_mlp_out[b * INPUT_STRIDE * NUM_TOPK + k * INPUT_STRIDE + i]
+              << 16;
+          float val;
+          __builtin_memcpy(&val, &v_bits, 4);
+          sum += val * rw[k];
+        }
+
+        // Write residual-added result for next layer
+        d_x_out[b * REDUCTION_SIZE + i] = _gang_float_to_bf16(sum);
+        // Accumulate SSQ in f32 (no bf16 round-trip)
+        ssq += sum * sum;
+      }
+
+// Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        ssq += __shfl_xor(ssq, offset);
+      }
+      #endif
+
+      // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
+      float *s_red = (float *)_rnlm_smem;
+      int _wave_id = tid >> 6;
+      int _lane_id = tid & 63;
+      int _num_waves = blockDim.x >> 6;
+      if (_lane_id == 0) {
+        s_red[_wave_id] = ssq;
+      }
+      __syncthreads();
+
+      float rms_rcp;
+      if (_wave_id == 0) {
+        ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+        for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
+          ssq += __shfl_xor(ssq, offset);
+        }
+        if (_lane_id == 0) {
+          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        }
+      }
+      __syncthreads();
+      rms_rcp = s_red[0];
+
+      // Pass 2: Apply norm weight + write to norm scratch (vectorized 4×bf16)
+      {
+        using bf16 = __hip_bfloat16;
+        constexpr int VEC = 4; // 4 bf16 per 64-bit load
+        bf16 const *x_in = (bf16 const *)d_x_out + b * REDUCTION_SIZE;
+        bf16 const *w_in = (bf16 const *)d_norm_w;
+        bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
+        constexpr int VEC_ITERS = REDUCTION_SIZE / (VEC);
+        for (int vi = tid; vi < VEC_ITERS; vi += blockDim.x) {
+          int off = vi * VEC;
+          uint64_t xv, wv;
+          __builtin_memcpy(&xv, &x_in[off], 8);
+          __builtin_memcpy(&wv, &w_in[off], 8);
+          bf16 const *xa = (bf16 const *)&xv;
+          bf16 const *wa = (bf16 const *)&wv;
+          bf16 ov[VEC];
+#pragma unroll
+          for (int j = 0; j < VEC; j++) {
+            ov[j] = __float2bfloat16(__bfloat162float(xa[j]) * rms_rcp *
+                                     __bfloat162float(wa[j]));
+          }
+          __builtin_memcpy(&out[off], ov, 8);
+        }
+      }
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+  __syncthreads();
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  // _sp_t1 now captures fused MulSumAdd+RMSNorm (was two separate steps)
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+    _sp_t2 = _sp_t1;
+  }
+#endif
+  // ── Tile dispatch ───────────────────────────────────────────────────────
+  int tok_idx = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+
+  if (tok_idx >= batch_count) {
+    return;
+  }
+
+  // Workgroup weight pointers
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Step 2: Quantize/copy BF16 normalized input to LDS ──────────────────
+  unsigned short const *input_row =
+      (unsigned short const *)norm_scratch_ptr + tok_idx * REDUCTION_SIZE;
+  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+      input_row, s_tok_fp8, s_tok_scales);
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 3: MFMA FP4(weights) x FP4/FP8/BF16(tokens) ──────────────────
+  if constexpr (OUTPUT_PER_WG >= 64) {
+    // N-parallel: 4 waves handle different output rows (depth-4 pipeline)
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+      int wave_tile = warp_id + tile_iter * NUM_WAVES;
+      int w_row = wave_tile * 16 + col;
+
+      int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+      int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+      f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      // Pre-fill: load k-tiles 0..3 into pipeline slots
+      i32x8_t a0 =
+          *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+      int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+      i32x8_t a1 =
+          *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+      int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+      i32x8_t a2 =
+          *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+      int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+      i32x8_t a3 =
+          *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+      int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+#pragma unroll 1
+      for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+        {
+          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki];
+          acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+        }
+        if (ki + 4 < MFMA_ITERS) {
+          int kt4 = (ki + 4) * K_PER_MFMA;
+          a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+          sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+        }
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 1];
+          acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+        }
+        if (ki + 5 < MFMA_ITERS) {
+          int kt5 = (ki + 5) * K_PER_MFMA;
+          a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+          sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+        }
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 2];
+          acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+        }
+        if (ki + 6 < MFMA_ITERS) {
+          int kt6 = (ki + 6) * K_PER_MFMA;
+          a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+          sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+        }
+        if (ki + 3 < MFMA_ITERS) {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 3];
+          acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+        }
+        if (ki + 7 < MFMA_ITERS) {
+          int kt7 = (ki + 7) * K_PER_MFMA;
+          a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+          sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+        }
+      }
+
+      // ── Step 4: Bias epilogue, write BF16 output ─────────────────────────
+      if (col == 0) {
+        for (int i = 0; i < 4; i++) {
+          int out_n = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
+          float sum = acc[i];
+
+          unsigned bt = (unsigned)d_bias[out_n] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+
+          int out_idx = tok_idx * output_stride + out_n;
+          d_qkv_output[out_idx] = _gang_float_to_bf16(sum + bv);
+        }
+      }
+    }
+  } else {
+    // K-parallel: 4 waves all process same 16 rows, split K across waves.
+    // Depth-4 pipelined: 4 weight K-tiles pre-loaded, compute overlaps with
+    // prefetch of next 4.
+    constexpr int TOTAL_K_ITERS = MFMA_ITERS;
+    constexpr int ITERS_PER_WAVE = TOTAL_K_ITERS / NUM_WAVES;
+    static_assert(TOTAL_K_ITERS % NUM_WAVES == 0,
+                  "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
+    static_assert(ITERS_PER_WAVE >= 4,
+                  "Depth-4 K-parallel requires ITERS_PER_WAVE >= 4");
+
+    int const ki_start = warp_id * ITERS_PER_WAVE;
+    int const ki_end = ki_start + ITERS_PER_WAVE;
+
+    int w_row = col;
+    int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Pre-fill: load k-tiles 0..3 into pipeline slots
+    i32x8_t a0 =
+        *(i32x8_t const *)(wg_data + row_data_base + ki_start * 64 + g * 16);
+    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
+    i32x8_t a1 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 1) * 64 + g * 16);
+    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
+    i32x8_t a2 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 2) * 64 + g * 16);
+    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
+    i32x8_t a3 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 3) * 64 + g * 16);
+    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+
+#pragma unroll 1
+    for (int ki = ki_start; ki < ki_end; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki];
+        acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+      }
+      if (ki + 4 < ki_end) {
+        int kt4 = (ki + 4) * K_PER_MFMA;
+        a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 1];
+        acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+      }
+      if (ki + 5 < ki_end) {
+        int kt5 = (ki + 5) * K_PER_MFMA;
+        a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 2];
+        acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+      }
+      if (ki + 6 < ki_end) {
+        int kt6 = (ki + 6) * K_PER_MFMA;
+        a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      }
+
+      if (ki + 3 < ki_end) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 3];
+        acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+      }
+      if (ki + 7 < ki_end) {
+        int kt7 = (ki + 7) * K_PER_MFMA;
+        a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      }
+    }
+
+    float *lds_reduce = (float *)_rnlm_smem;
+    if (col == 0) {
+      for (int i = 0; i < 4; i++) {
+        lds_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && col == 0) {
+      for (int i = 0; i < 4; i++) {
+        float v = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          v += lds_reduce[w * OUTPUT_PER_WG + g * 4 + i];
+        }
+
+        int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
+
+        unsigned bt = (unsigned)d_bias[out_n] << 16;
+        float bv;
+        __builtin_memcpy(&bv, &bt, 4);
+
+        int out_idx = tok_idx * output_stride + out_n;
+        d_qkv_output[out_idx] = _gang_float_to_bf16(v + bv);
+      }
+    }
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t4 = __builtin_amdgcn_s_memrealtime();
+    // Slot 0: QKV. [0]=Fused MulSumAdd+RMSNorm [1]=0 (fused) [2]=FP8Quant
+    // [3]=MFMA+Epi
+    atomicAdd(&g_subphase_ns[0][0], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[0][1], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[0][2], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_ns[0][3], (_sp_t4 - _sp_t3) * 10);
+    atomicAdd(&g_subphase_cnt[0], 1ULL);
+  }
+#endif
+  __syncthreads();
+}
+
+// =========================================================================
+// Fused RMSNorm + MXFP4 Gang Linear + KV Cache Update (RoPE + paged write).
+//
+// Eliminates the separate kv_cache_update task by fusing it into the QKV
+// MFMA epilogue.  Each XCD handles exactly one KV head group:
+//   wg_idx 0 .. NUM_Q_PER_KV-1  →  Q heads  →  RoPE → q_workspace
+//   wg_idx NUM_Q_PER_KV          →  K head   →  RoPE → paged K cache
+//   wg_idx NUM_Q_PER_KV+1        →  V head   →  paged V cache (no RoPE)
+//
+// RoPE cross-wave communication uses LDS (HEAD_DIM bf16 values reusing FP8
+// token area that is dead after MFMA).
+// =========================================================================
+
+// Local XCD ID helper (avoids include-order dependency on
+// persistent_kernel.cuh)
+__device__ __forceinline__ int _kvupd_get_xcd_id() {
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  int xcd_id;
+  MPK_GET_XCC_ID16(xcd_id);
+  // HW gives the PHYSICAL die (0-7) even when only a subset runs. Every
+  // per-XCD array here is sized for MPK_NUM_XCDS, so fold it. Identity
+  // in the default 8-XCD build.
+  xcd_id %= MPK_NUM_XCDS;
+  return xcd_id;
+#else
+  return 0;
+#endif
+}
+
+// Splits wg_idx into the KV head it belongs to and the role within that head's
+// group of NUM_Q_PER_KV + 2 tiles. At 8 XCDs a partition owns exactly one group
+// and wg_idx is itself the role; with fewer XCDs it owns several consecutive
+// groups, so the head cannot come from the XCD id alone.
+__device__ __forceinline__ void _kvupd_head_role(int wg_idx,
+                                                 int n_wgs_per_xcd,
+                                                 int num_q_per_kv,
+                                                 int &kv_head,
+                                                 int &kv_role) {
+  int const per_group = num_q_per_kv + 2;
+  int const groups = n_wgs_per_xcd / per_group;
+  int const xcd = _kvupd_get_xcd_id();
+  if (groups <= 1) {
+    kv_head = xcd;
+    kv_role = wg_idx;
+  } else {
+    kv_head = xcd * groups + wg_idx / per_group;
+    kv_role = wg_idx - (wg_idx / per_group) * per_group;
+  }
+}
+
+// ── Inline RoPE epilogue helper ─────────────────────────────────────────
+// Writes MFMA accumulator to LDS, applies RoPE via cross-wave communication,
+// then writes the result to `dst`.
+// Call from within the tile_iter loop with all threads participating.
+template <int HEAD_DIM>
+__device__ __forceinline__ void _kvupd_rope_epilogue(
+    float const *acc,               // [4] accumulator values for this lane
+    unsigned short const *bias,     // bias array (partitioned per XCD)
+    int wg_idx,                     // workgroup index within XCD
+    int wave_tile,                  // wave_tile index
+    int g,                          // lane group (0..3)
+    int col,                        // lane column (0..15)
+    int tid,                        // MPK_TIDX_Q
+    unsigned short const *cos_data, // cos[HEAD_DIM] bf16
+    unsigned short const *sin_data, // sin[HEAD_DIM] bf16
+    unsigned short *dst,            // destination array
+    int dst_stride,                 // stride between tokens in dst
+    int tok_idx,                    // token index
+    int head_offset,                // head offset within dst row
+    int output_per_wg,              // OUTPUT_PER_WG
+    unsigned short *s_rope)         // LDS buffer [HEAD_DIM] bf16
+{
+  // Step 1: col==0 lanes write biased values to LDS
+  if (col == 0) {
+    int d0 = wave_tile * 16 + g * 4;
+    // Batch-load 4 contiguous bf16 bias values as one 64-bit load
+    uint64_t bias4;
+    __builtin_memcpy(&bias4, &bias[wg_idx * output_per_wg + d0], 8);
+    unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      unsigned bt = (unsigned)b4[i] << 16;
+      float bv;
+      __builtin_memcpy(&bv, &bt, 4);
+      s_rope[d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+    }
+  }
+  __syncthreads();
+
+  // Step 2: 32 threads apply RoPE (element d paired with d + HEAD_DIM/2)
+  constexpr int HALF = HEAD_DIM / 2;
+  if (tid < HALF) {
+    int d = tid;
+    unsigned v0_bits = (unsigned)s_rope[d] << 16;
+    unsigned v1_bits = (unsigned)s_rope[d + HALF] << 16;
+    float v0, v1;
+    __builtin_memcpy(&v0, &v0_bits, 4);
+    __builtin_memcpy(&v1, &v1_bits, 4);
+
+    unsigned c_bits = (unsigned)cos_data[d] << 16;
+    unsigned s_bits = (unsigned)sin_data[d] << 16;
+    float c, s;
+    __builtin_memcpy(&c, &c_bits, 4);
+    __builtin_memcpy(&s, &s_bits, 4);
+
+    s_rope[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+    s_rope[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+  }
+  __syncthreads();
+
+  // Step 3: Write HEAD_DIM bf16 values from LDS to destination
+  for (int d = tid; d < HEAD_DIM; d += 256 /*blockDim.x*/) {
+    dst[tok_idx * dst_stride + head_offset + d] = s_rope[d];
+  }
+}
+
+// ── N-axis-packed RoPE epilogue ─────────────────────────────────────────
+// Same three steps as above, with a token dimension. The MFMA produced
+// D[m][n] for all 16 n columns; lane (g, col) holds m = wave_tile*16 + g*4 + i
+// for token n = col, so step 1 writes s_rope[col][d0+i] instead of
+// s_rope[d0+i]. Steps 2 and 3 flatten (token, element) into one strided loop
+// so all 256 threads stay busy -- HALF = 32, so the single-token version left
+// 224 of them idle.
+//
+// Positions are per token, so cos/sin rows come from s_global_pos[t] rather
+// than one precomputed row pointer.
+template <int HEAD_DIM, int TOK_ROWS>
+__device__ __forceinline__ void _kvupd_rope_epilogue_packed(
+    float const *acc,             // [4] accumulator values for this lane
+    unsigned short const *bias,   // bias array (partitioned per XCD)
+    int wg_idx,                   // workgroup index within XCD
+    int wave_tile,                // wave_tile index
+    int g,                        // lane group (0..3)
+    int col,                      // lane column (0..15) == this lane's token
+    int tid,                      // MPK_TIDX_Q
+    bool tok_active,              // col names a real token
+    int n_valid,                  // number of real tokens in this block
+    unsigned short const *cos_base, // cos[max_pos][HEAD_DIM] bf16
+    unsigned short const *sin_base, // sin[max_pos][HEAD_DIM] bf16
+    int const *s_global_pos,        // LDS [TOK_ROWS] absolute positions
+    unsigned short *dst,            // destination array
+    int dst_stride,                 // stride between tokens in dst
+    int tok_row_base,               // first token row of this column block
+    int head_offset,                // head offset within dst row
+    int output_per_wg,              // OUTPUT_PER_WG
+    unsigned short *s_rope          // LDS buffer [TOK_ROWS][HEAD_DIM] bf16
+#ifdef MPK_QKV_EPI_PF
+    ,
+    bool have_pf = false,           // bias / cos / sin below are loaded
+    unsigned bias_lo = 0,
+    unsigned bias_hi = 0,
+    unsigned short cos_pf = 0,
+    unsigned short sin_pf = 0
+#endif
+    )
+{
+  // Step 1: each lane writes its own token's slice.
+  //
+  // This guard sits strictly AFTER the caller's MFMA asm block has retired.
+  // Masking inactive lanes any earlier would let the compiler sink the exec
+  // mask up over the ds_read_b128 that feeds the MFMA, and then 60 of 64 lanes
+  // read stale B operands -- which corrupts the *active* lanes too, because a
+  // 16x16x128 MFMA is a whole-wave operation.
+  if (tok_active) {
+    int d0 = wave_tile * 16 + g * 4;
+    uint64_t bias4;
+#ifdef MPK_QKV_EPI_PF
+    if (have_pf) {
+      bias4 = (uint64_t)bias_lo | ((uint64_t)bias_hi << 32);
+    } else
+#endif
+    __builtin_memcpy(&bias4, &bias[wg_idx * output_per_wg + d0], 8);
+    unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      unsigned bt = (unsigned)b4[i] << 16;
+      float bv;
+      __builtin_memcpy(&bv, &bt, 4);
+      s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+    }
+  }
+  __syncthreads();
+
+  // Step 2: rotate in place; element d of token t pairs with d + HEAD_DIM/2.
+  constexpr int HALF = HEAD_DIM / 2;
+  for (int idx = tid; idx < TOK_ROWS * HALF; idx += 256) {
+    int const t = idx / HALF;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HALF;
+    unsigned short *row = s_rope + t * HEAD_DIM;
+    int const pos = s_global_pos[t];
+    unsigned short const *cos_data = cos_base + (long long)pos * HEAD_DIM;
+    unsigned short const *sin_data = sin_base + (long long)pos * HEAD_DIM;
+
+    unsigned v0_bits = (unsigned)row[d] << 16;
+    unsigned v1_bits = (unsigned)row[d + HALF] << 16;
+    float v0, v1;
+    __builtin_memcpy(&v0, &v0_bits, 4);
+    __builtin_memcpy(&v1, &v1_bits, 4);
+
+#ifdef MPK_QKV_EPI_PF
+    unsigned c_bits, s_bits;
+    if (have_pf) {
+      c_bits = (unsigned)cos_pf << 16;
+      s_bits = (unsigned)sin_pf << 16;
+    } else {
+      c_bits = (unsigned)cos_data[d] << 16;
+      s_bits = (unsigned)sin_data[d] << 16;
+    }
+#else
+    unsigned c_bits = (unsigned)cos_data[d] << 16;
+    unsigned s_bits = (unsigned)sin_data[d] << 16;
+#endif
+    float c, s;
+    __builtin_memcpy(&c, &c_bits, 4);
+    __builtin_memcpy(&s, &s_bits, 4);
+
+    row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+    row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+  }
+  __syncthreads();
+
+  // Step 3: write TOK_ROWS * HEAD_DIM bf16 values out.
+#ifdef MPK_ROPE_VEC_STORE
+  static_assert(HEAD_DIM % 4 == 0, "RoPE vec store needs 4-bf16 groups");
+  for (int idx = (int)tid * 4; idx < TOK_ROWS * HEAD_DIM; idx += 256 * 4) {
+    int const t = idx / HEAD_DIM;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HEAD_DIM;
+    unsigned long long packed;
+    __builtin_memcpy(&packed, &s_rope[idx], 8);
+    st_wt_u64(&dst[(long long)(tok_row_base + t) * dst_stride + head_offset +
+                   d],
+              packed);
+  }
+#else
+  for (int idx = tid; idx < TOK_ROWS * HEAD_DIM; idx += 256) {
+    int const t = idx / HEAD_DIM;
+    if (t >= n_valid) {
+      continue;
+    }
+    int const d = idx - t * HEAD_DIM;
+    dst[(long long)(tok_row_base + t) * dst_stride + head_offset + d] =
+        s_rope[idx];
+  }
+#endif
+}
+
+// ── Layer 0 variant (no MulSumAdd) ─────────────────────────────────────
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM,
+          int HEAD_DIM,
+          int NUM_Q_PER_KV,
+          int PAGE_SIZE>
+__device__ __noinline__ void gang_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
+    void const *norm_input_ptr,  // [batch, REDUCTION_SIZE] bf16
+    void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
+    void *norm_output_ptr,       // [batch, REDUCTION_SIZE] bf16 scratch
+    void const *weight_ptr,      // [n_wgs_per_xcd, wg_bytes] packed MXFP4
+    void const *bias_ptr,        // [1, output_size_per_xcd] bf16 (partitioned)
+    void *k_cache_ptr,           // paged K cache (un-partitioned base)
+    void *v_cache_ptr,           // paged V cache (un-partitioned base)
+    void *q_workspace_ptr,       // [batch, q_ws_stride] bf16
+    void const *cos_ptr,         // [max_seq_len, HEAD_DIM] bf16
+    void const *sin_ptr,         // [max_seq_len, HEAD_DIM] bf16
+    int const *qo_indptr,
+    int const *kv_indptr,
+    int const *kv_indices,
+    int const *kv_last_page_len,
+    int num_active_tokens,
+    int n_wgs_per_xcd,
+    int kv_stride,   // HEAD_DIM * num_kv_heads
+    int q_ws_stride, // num_q_heads * HEAD_DIM
+    int tile_idx) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0);
+  static_assert(REDUCTION_SIZE % 128 == 0);
+  static_assert(OUTPUT_PER_WG == HEAD_DIM,
+                "KV_UPD fusion requires OUTPUT_PER_WG == HEAD_DIM");
+
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 1: Redundant RMSNorm ─────────────────────────────────────────
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+  for (int b = 0; b < batch_count; b++) {
+    unsigned short const *row_in =
+        (unsigned short const *)norm_input_ptr + b * REDUCTION_SIZE;
+    unsigned short *row_out =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short *)norm_output_ptr + PRENORM_AID_OFF + b * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
+        (unsigned short *)norm_output_ptr + b * REDUCTION_SIZE;
+        #endif
+    gang_rmsnorm_detail::rmsnorm_inline_amd<REDUCTION_SIZE, ACTUAL_HIDDEN_DIM>(
+        row_in,
+#ifdef MPK_GAMMA_AID
+        (void const *)((unsigned short const *)norm_weight_ptr +
+                       ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                                (MPK_NUM_XCDS / 2)
+                            ? REDUCTION_SIZE
+                            : 0)),
+#else
+        norm_weight_ptr,
+#endif
+        row_out);
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Tile dispatch ─────────────────────────────────────────────────────
+  int tok_idx = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+  if (tok_idx >= batch_count) {
+    return;
+  }
+
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Step 2: Quantize/copy normalized input to LDS ────────────────────
+  {
+    unsigned short const *input_row =
+        #ifdef MPK_PRENORM_AID
+        #define PRENORM_AID_OFF ((int)(kernel::mpk_prenorm_xcc() & 0x7) >= (MPK_NUM_XCDS / 2) ? (long long)BATCH_SIZE * REDUCTION_SIZE : 0)
+        (unsigned short const *)norm_output_ptr + PRENORM_AID_OFF + tok_idx * REDUCTION_SIZE;
+        #undef PRENORM_AID_OFF
+        #else
+        (unsigned short const *)norm_output_ptr + tok_idx * REDUCTION_SIZE;
+        #endif
+    _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+        input_row, s_tok_fp8, s_tok_scales);
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t2 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 3: MFMA ───────────────────────────────────────────────────
+  for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+    int wave_tile = warp_id + tile_iter * NUM_WAVES;
+    int w_row = wave_tile * 16 + col;
+    int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8_t a0 = *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+    int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+    i32x8_t a1 = *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+    int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+    i32x8_t a2 = *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+    int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+    i32x8_t a3 = *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+    int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+#pragma unroll 1
+    for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki];
+        acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+      }
+      if (ki + 4 < MFMA_ITERS) {
+        int kt = (ki + 4) * K_PER_MFMA;
+        a0 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa0 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 1];
+        acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+      }
+      if (ki + 5 < MFMA_ITERS) {
+        int kt = (ki + 5) * K_PER_MFMA;
+        a1 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa1 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 2];
+        acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+      }
+      if (ki + 6 < MFMA_ITERS) {
+        int kt = (ki + 6) * K_PER_MFMA;
+        a2 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa2 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      if (ki + 3 < MFMA_ITERS) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 3];
+        acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+      }
+      if (ki + 7 < MFMA_ITERS) {
+        int kt = (ki + 7) * K_PER_MFMA;
+        a3 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa3 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+    }
+    // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
+    int request_id = 0;
+    while (qo_indptr[request_id + 1] <= tok_idx) {
+      request_id++;
+    }
+    int token_in_request = tok_idx - qo_indptr[request_id];
+    int first_page = kv_indptr[request_id];
+    int num_pages = kv_indptr[request_id + 1] - first_page;
+    int last_page_len_val = kv_last_page_len[request_id];
+    int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
+    int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
+    int global_pos = global_seq_len - num_new_tokens + token_in_request;
+    unsigned short const *cos_row =
+        (unsigned short const *)cos_ptr + global_pos * HEAD_DIM;
+    unsigned short const *sin_row =
+        (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
+    unsigned short *s_rope = (unsigned short *)_rnlm_smem;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
+      _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
+                                     d_bias,
+                                     wg_idx,
+                                     wave_tile,
+                                     g,
+                                     col,
+                                     tid,
+                                     cos_row,
+                                     sin_row,
+                                     (unsigned short *)q_workspace_ptr,
+                                     q_ws_stride,
+                                     tok_idx,
+                                     q_head_global * HEAD_DIM,
+                                     OUTPUT_PER_WG,
+                                     s_rope);
+    } else if (kv_role == NUM_Q_PER_KV) {
+      int page_num = global_pos / PAGE_SIZE;
+      int page_offset = global_pos % PAGE_SIZE;
+      int page_idx = kv_indices[first_page + page_num];
+      int dst_idx = page_idx * PAGE_SIZE + page_offset;
+      if (col == 0) {
+        int d0 = wave_tile * 16 + g * 4;
+        uint64_t bias4;
+        __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+        unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          s_rope[d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+        }
+      }
+      __syncthreads();
+      constexpr int HALF = HEAD_DIM / 2;
+      if (tid < HALF) {
+        unsigned v0b = (unsigned)s_rope[tid] << 16;
+        unsigned v1b = (unsigned)s_rope[tid + HALF] << 16;
+        float v0, v1;
+        __builtin_memcpy(&v0, &v0b, 4);
+        __builtin_memcpy(&v1, &v1b, 4);
+        unsigned cb = (unsigned)cos_row[tid] << 16;
+        unsigned sb = (unsigned)sin_row[tid] << 16;
+        float c, s;
+        __builtin_memcpy(&c, &cb, 4);
+        __builtin_memcpy(&s, &sb, 4);
+        s_rope[tid] = _gang_float_to_bf16(v0 * c - v1 * s);
+        s_rope[tid + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+      }
+      __syncthreads();
+      unsigned short *d_k = (unsigned short *)k_cache_ptr;
+      for (int d = tid; d < HEAD_DIM; d += 256) {
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
+      }
+    } else {
+      int page_num = global_pos / PAGE_SIZE;
+      int page_offset = global_pos % PAGE_SIZE;
+      int page_idx = kv_indices[first_page + page_num];
+      int dst_idx = page_idx * PAGE_SIZE + page_offset;
+      unsigned short *d_v = (unsigned short *)v_cache_ptr;
+      if (col == 0) {
+        int d0 = wave_tile * 16 + g * 4;
+        uint64_t bias4;
+        __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+        unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
+              _gang_float_to_bf16(acc[i] + bv);
+        }
+      }
+    }
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+    // Slot 1: QKV_KVUPD. [1]=RMSNorm [2]=FP8Quant [3]=MFMA
+    atomicAdd(&g_subphase_ns[1][1], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[1][2], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[1][3], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_cnt[1], 1ULL);
+  }
+#endif
+  __syncthreads();
+}
+
+// ── Layers 1+ variant (MulSumAdd + RMSNorm + MXFP4 + KV_UPD) ──────────
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM,
+          int HEAD_DIM,
+          int NUM_Q_PER_KV,
+          int PAGE_SIZE,
+          int NUM_TOPK = 4,
+          int INPUT_STRIDE = REDUCTION_SIZE>
+__device__ __noinline__ void
+    gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
+        void const *mlp_out_ptr,
+        void const *routing_weight_ptr,
+        void const *residual_ptr,
+        void const *norm_weight_ptr,
+        void *norm_scratch_ptr,
+        void const *weight_ptr,
+        void const *bias_ptr,
+        void *x_output_ptr,
+        void *k_cache_ptr,
+        void *v_cache_ptr,
+        void *q_workspace_ptr,
+        void const *cos_ptr,
+        void const *sin_ptr,
+        int const *qo_indptr,
+        int const *kv_indptr,
+        int const *kv_indices,
+        int const *kv_last_page_len,
+        int num_active_tokens,
+        int n_wgs_per_xcd,
+        int kv_stride,
+        int q_ws_stride,
+        int tile_idx) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0);
+  static_assert(REDUCTION_SIZE % 128 == 0);
+  static_assert(OUTPUT_PER_WG == HEAD_DIM,
+                "KV_UPD fusion requires OUTPUT_PER_WG == HEAD_DIM");
+
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
+                     _sp_t3b = 0, _sp_t4 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+
+  // ── Step 0+1 FUSED: MulSumAdd + RMSNorm in single pass ───────────────
+  // Computes x = residual + Σ(mlp_out[k] * w[k]) and accumulates SSQ for
+  // RMSNorm in the same loop. Eliminates the intermediate bf16 global
+  // memory round-trip (was ~4.5 µs MulSumAdd + ~3.2 µs RMSNorm = ~7.7 µs).
+  {
+    unsigned short const *d_mlp_out = (unsigned short const *)mlp_out_ptr;
+    float const *d_rw = (float const *)routing_weight_ptr;
+    unsigned short const *d_residual = (unsigned short const *)residual_ptr;
+    unsigned short *d_x_out = (unsigned short *)x_output_ptr;
+    unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
+    unsigned short *d_norm_out = (unsigned short *)norm_scratch_ptr;
+
+    for (int b = 0; b < batch_count; b++) {
+      float rw[NUM_TOPK];
+#pragma unroll
+      for (int k = 0; k < NUM_TOPK; k++) {
+        rw[k] = d_rw[b * NUM_TOPK + k];
+      }
+
+      // Pass 1: Fused weighted-sum + residual-add + SSQ accumulation
+      float ssq = 0.0f;
+      for (int i = tid; i < REDUCTION_SIZE; i += blockDim.x) {
+        unsigned r_bits = (unsigned)d_residual[b * REDUCTION_SIZE + i] << 16;
+        float sum;
+        __builtin_memcpy(&sum, &r_bits, 4);
+#pragma unroll
+        for (int k = 0; k < NUM_TOPK; k++) {
+          unsigned v_bits =
+              (unsigned)
+                  d_mlp_out[b * INPUT_STRIDE * NUM_TOPK + k * INPUT_STRIDE + i]
+              << 16;
+          float val;
+          __builtin_memcpy(&val, &v_bits, 4);
+          sum += val * rw[k];
+        }
+        d_x_out[b * REDUCTION_SIZE + i] = _gang_float_to_bf16(sum);
+        // Accumulate SSQ — inline asm prevents compiler from splitting
+        // this into a separate re-read pass
+        asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(sum));
+      }
+
+// Wavefront reduction (AMD wavefront = 64 lanes)
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        ssq += __shfl_xor(ssq, offset);
+      }
+      #endif
+
+      // Cross-wave reduction via shared memory (reuse FP8 area, dead here)
+      float *s_red = (float *)_rnlm_smem;
+      int _wave_id = tid >> 6;
+      int _lane_id = tid & 63;
+      int _num_waves = blockDim.x >> 6;
+      if (_lane_id == 0) {
+        s_red[_wave_id] = ssq;
+      }
+      __syncthreads();
+
+      float rms_rcp;
+      if (_wave_id == 0) {
+        ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+        for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
+          ssq += __shfl_xor(ssq, offset);
+        }
+        if (_lane_id == 0) {
+          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        }
+      }
+      __syncthreads();
+      rms_rcp = s_red[0];
+
+      // Pass 2: Apply norm weight + write to norm scratch (or stash for fused
+      // BF16 copy)
+      {
+        using bf16 = __hip_bfloat16;
+        constexpr int VEC = 4; // 4 bf16 per 64-bit load
+        bf16 const *x_in = (bf16 const *)d_x_out + b * REDUCTION_SIZE;
+        bf16 const *w_in = (bf16 const *)d_norm_w;
+        bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
+        constexpr int VEC_ITERS = REDUCTION_SIZE / (VEC);
+        for (int vi = tid; vi < VEC_ITERS; vi += blockDim.x) {
+          int off = vi * VEC;
+          uint64_t xv, wv;
+          __builtin_memcpy(&xv, &x_in[off], 8);
+          __builtin_memcpy(&wv, &w_in[off], 8);
+          bf16 const *xa = (bf16 const *)&xv;
+          bf16 const *wa = (bf16 const *)&wv;
+          bf16 ov[VEC];
+#pragma unroll
+          for (int j = 0; j < VEC; j++) {
+            ov[j] = __float2bfloat16(__bfloat162float(xa[j]) * rms_rcp *
+                                     __bfloat162float(wa[j]));
+          }
+          __builtin_memcpy(&out[off], ov, 8);
+        }
+      }
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+  __syncthreads();
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+    _sp_t2 = _sp_t1;
+  }
+#endif
+  // ── Tile dispatch ─────────────────────────────────────────────────────
+  int tok_idx = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+  if (tok_idx >= batch_count) {
+    return;
+  }
+
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Step 2: Prepare activation in LDS ──────────────────────────────────
+  {
+    unsigned short const *input_row =
+        (unsigned short const *)norm_scratch_ptr + tok_idx * REDUCTION_SIZE;
+    _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+        input_row, s_tok_fp8, s_tok_scales);
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 3: MFMA ───────────────────────────────────────────────────
+  for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+    int wave_tile = warp_id + tile_iter * NUM_WAVES;
+    int w_row = wave_tile * 16 + col;
+    int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8_t a0 = *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+    int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+    i32x8_t a1 = *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+    int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+    i32x8_t a2 = *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+    int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+    i32x8_t a3 = *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+    int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+#pragma unroll 1
+    for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki];
+        acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+      }
+      if (ki + 4 < MFMA_ITERS) {
+        int kt = (ki + 4) * K_PER_MFMA;
+        a0 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa0 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 1];
+        acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+      }
+      if (ki + 5 < MFMA_ITERS) {
+        int kt = (ki + 5) * K_PER_MFMA;
+        a1 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa1 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 2];
+        acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+      }
+      if (ki + 6 < MFMA_ITERS) {
+        int kt = (ki + 6) * K_PER_MFMA;
+        a2 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa2 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+      if (ki + 3 < MFMA_ITERS) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 3];
+        acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+      }
+      if (ki + 7 < MFMA_ITERS) {
+        int kt = (ki + 7) * K_PER_MFMA;
+        a3 = *(i32x8_t const *)(wg_data + row_data_base + kt / 2 + g * 16);
+        sa3 = (int)wg_scales[row_scale_base + kt / 32 + g];
+      }
+    }
+    // ── Step 4: Fused KV_UPD epilogue ──────────────────────────────────
+    int kv_head, kv_role;
+    _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
+    int request_id = 0;
+    while (qo_indptr[request_id + 1] <= tok_idx) {
+      request_id++;
+    }
+    int token_in_request = tok_idx - qo_indptr[request_id];
+    int first_page = kv_indptr[request_id];
+    int num_pages = kv_indptr[request_id + 1] - first_page;
+    int last_page_len_val = kv_last_page_len[request_id];
+    int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
+    int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
+    int global_pos = global_seq_len - num_new_tokens + token_in_request;
+    unsigned short const *cos_row =
+        (unsigned short const *)cos_ptr + global_pos * HEAD_DIM;
+    unsigned short const *sin_row =
+        (unsigned short const *)sin_ptr + global_pos * HEAD_DIM;
+    unsigned short *s_rope = (unsigned short *)_rnlm_smem;
+    if (kv_role < NUM_Q_PER_KV) {
+      int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
+      _kvupd_rope_epilogue<HEAD_DIM>((float const *)&acc,
+                                     d_bias,
+                                     wg_idx,
+                                     wave_tile,
+                                     g,
+                                     col,
+                                     tid,
+                                     cos_row,
+                                     sin_row,
+                                     (unsigned short *)q_workspace_ptr,
+                                     q_ws_stride,
+                                     tok_idx,
+                                     q_head_global * HEAD_DIM,
+                                     OUTPUT_PER_WG,
+                                     s_rope);
+    } else if (kv_role == NUM_Q_PER_KV) {
+      int page_num = global_pos / PAGE_SIZE;
+      int page_offset = global_pos % PAGE_SIZE;
+      int page_idx = kv_indices[first_page + page_num];
+      int dst_idx = page_idx * PAGE_SIZE + page_offset;
+      if (col == 0) {
+        int d0 = wave_tile * 16 + g * 4;
+        uint64_t bias4;
+        __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+        unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          s_rope[d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+        }
+      }
+      __syncthreads();
+      constexpr int HALF = HEAD_DIM / 2;
+      if (tid < HALF) {
+        unsigned v0b = (unsigned)s_rope[tid] << 16;
+        unsigned v1b = (unsigned)s_rope[tid + HALF] << 16;
+        float v0, v1;
+        __builtin_memcpy(&v0, &v0b, 4);
+        __builtin_memcpy(&v1, &v1b, 4);
+        unsigned cb = (unsigned)cos_row[tid] << 16;
+        unsigned sb = (unsigned)sin_row[tid] << 16;
+        float c, s;
+        __builtin_memcpy(&c, &cb, 4);
+        __builtin_memcpy(&s, &sb, 4);
+        s_rope[tid] = _gang_float_to_bf16(v0 * c - v1 * s);
+        s_rope[tid + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+      }
+      __syncthreads();
+      unsigned short *d_k = (unsigned short *)k_cache_ptr;
+      for (int d = tid; d < HEAD_DIM; d += 256) {
+        d_k[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] = s_rope[d];
+      }
+    } else {
+      int page_num = global_pos / PAGE_SIZE;
+      int page_offset = global_pos % PAGE_SIZE;
+      int page_idx = kv_indices[first_page + page_num];
+      int dst_idx = page_idx * PAGE_SIZE + page_offset;
+      unsigned short *d_v = (unsigned short *)v_cache_ptr;
+      if (col == 0) {
+        int d0 = wave_tile * 16 + g * 4;
+        uint64_t bias4;
+        __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+        unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          d_v[(long long)dst_idx * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d0 + i] =
+              _gang_float_to_bf16(acc[i] + bv);
+        }
+      }
+    }
+  }
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t4 = __builtin_amdgcn_s_memrealtime();
+    // Slot 1: QKV_KVUPD. [0]=MulSumAdd [1]=RMSNorm [2]=FP8Quant [3]=MFMA
+    // [4]=KVUpdEpi
+    atomicAdd(&g_subphase_ns[1][0], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[1][1], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[1][2], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_ns[1][3], (_sp_t4 - _sp_t3) * 10);
+    atomicAdd(&g_subphase_cnt[1], 1ULL);
+  }
+#endif
+  __syncthreads();
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// ResAddF32 variants: read from f32 workspace (written by W2 atomicAdd)
+// instead of doing MulSumAdd from 4 bf16 expert slots.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Non-KVUpd variant: ResAddF32 + RMSNorm + MXFP4 + Bias ──────────────
+// Replaces gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kernel for layers 1+
+// when W2 epilogue already did routing_weight * result → atomicAdd to f32
+// workspace.
+//
+// Prologue: x[h] = workspace_f32[h] + residual_bf16[h]; workspace_f32[h] = 0;
+// Then RMSNorm + FP8 quant + MFMA + bias epilogue (identical to mulsumradd).
+//
+// 5 inputs (workspace_f32, residual, norm_weight, mxfp4_weight, bias)
+// + 1 inout (norm_scratch) → workspace_f32 is also zeroed (read+write).
+// We pass workspace_f32 as both input[0] and output[0] (x_output replaced).
+//
+// Input layout matches mulsumradd for easy swapping:
+//   input[0] = workspace_f32 [batch, REDUCTION_SIZE] f32
+//   input[1] = residual [batch, REDUCTION_SIZE] bf16
+//   input[2] = norm_weight [REDUCTION_SIZE] bf16
+//   input[3] = norm_scratch [batch, REDUCTION_SIZE] bf16
+//   input[4] = mxfp4_weight [n_wgs_per_xcd, wg_bytes]
+//   input[5] = bias [1, output_size_per_xcd] bf16
+//   output[0] = x_output [batch, REDUCTION_SIZE] bf16 (residual stream)
+//   output[1] = qkv_output [batch, output_stride] bf16
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM = REDUCTION_SIZE>
+__device__ __noinline__ void gang_resaddf32_rmsnorm_linear_mxfp4_bias_kernel(
+    void *workspace_f32_ptr,     // [batch, REDUCTION_SIZE] f32 (read + zero)
+    void const *residual_ptr,    // [batch, REDUCTION_SIZE] bf16
+    void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
+    void *norm_scratch_ptr,      // [batch, REDUCTION_SIZE] bf16
+    void const *weight_ptr,      // [n_wgs_per_xcd, wg_bytes] packed MXFP4
+    void const *bias_ptr,        // [1, output_size_per_xcd] bf16
+    void *x_output_ptr,          // [batch, REDUCTION_SIZE] bf16
+    void *qkv_output_ptr,        // [batch, output_stride] bf16
+    int num_active_tokens,
+    int n_wgs_per_xcd,
+    int output_stride,
+    int tile_idx) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0,
+                "OUTPUT_PER_WG must be multiple of 16");
+  static_assert(REDUCTION_SIZE % 128 == 0,
+                "REDUCTION_SIZE must be multiple of 128 for FP4 MFMA");
+
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  static_assert(MFMA_ITERS >= 4,
+                "Depth-4 pipeline requires REDUCTION_SIZE >= 512");
+  constexpr int BF16_MFMA_ITERS = REDUCTION_SIZE / 32;
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+
+  // ── Token activation in shared memory ────────────────────────────────────
+  constexpr int FP8_TOK_DATA = REDUCTION_SIZE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+  unsigned short *d_qkv_output = (unsigned short *)qkv_output_ptr;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem;
+  uint8_t *s_tok_scales = s_tok_fp8 + FP8_TOK_DATA;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
+                     _sp_t3b = 0, _sp_t4 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+
+  // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
+  // Reads f32 workspace (pre-accumulated by W2 atomicAdd), adds bf16 residual,
+  // zeros workspace, computes SSQ for RMSNorm — all in a single pass.
+  {
+#ifdef MPK_WSF32_AID
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
+    float *d_ws = (float *)workspace_f32_ptr;
+#endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
+#endif
+    unsigned short const *d_residual = (unsigned short const *)residual_ptr;
+    unsigned short *d_x_out = (unsigned short *)x_output_ptr;
+    unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
+    unsigned short *d_norm_out = (unsigned short *)norm_scratch_ptr;
+
+    for (int b = 0; b < batch_count; b++) {
+      // Pass 1: workspace_f32 + residual → x_out, accumulate SSQ
+      // Vectorized: float4 for f32 workspace, uint2 for bf16 residual/output
+      // NOTE: Do NOT zero workspace here — multiple gang workers race on this.
+      float ssq = 0.0f;
+      // Register cache: store resadd sums (f32) to avoid re-reading x_out in
+      // Pass 2
+      constexpr int _VEC = 4;
+      constexpr int _BLOCK_VEC = 256 * _VEC;
+      constexpr int _MAX_ITERS = (REDUCTION_SIZE + _BLOCK_VEC - 1) / _BLOCK_VEC;
+      float s_cache[_MAX_ITERS * _VEC];
+      int n_cached = 0;
+      {
+        constexpr int VEC = 4;
+        // REDUCTION_SIZE / (blockDim.x * VEC) iterations per thread
+        // e.g. 3072 / (256 * 4) = 3 iterations — fully unrollable
+        constexpr int BLOCK_VEC = 256 * VEC; // elements per block per iteration
+        float const *ws_base = d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE);
+        unsigned short const *res_base = d_residual + b * REDUCTION_SIZE;
+        unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
+
+#pragma unroll
+        for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+          // Vectorized load: 4 f32 from workspace (flat_load_dwordx4), then
+          // sum the remaining expert slots in fixed slot order. See
+          // moe_ws_layout.cuh for why this is a per-slot reduction here rather
+          // than an atomicAdd in the W2 epilogue.
+          float4 ws4;
+          __builtin_memcpy(&ws4, ws_base + off, 16);
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+            float4 slot4;
+            __builtin_memcpy(&slot4, ws_base + s * REDUCTION_SIZE + off, 16);
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
+#endif
+#ifdef MPK_WS_FARCOPY
+          // A poisoned slot makes the sum NaN: four self-compares on the
+          // fast path, the validated fold only when one trips.
+          if (__builtin_expect((ws4.x != ws4.x) | (ws4.y != ws4.y) |
+                                   (ws4.z != ws4.z) | (ws4.w != ws4.w),
+                               0)) {
+            ws4 = mpk_ws_farcopy_fold((float const *)ws_base,
+                                      (float const *)workspace_f32_ptr,
+                                      REDUCTION_SIZE, off);
+          }
+#endif
+
+          // Vectorized load: 4 bf16 from residual as uint2 (flat_load_dwordx2)
+          uint2 res_packed;
+          __builtin_memcpy(&res_packed, res_base + off, 8);
+
+          // Extract 4 bf16 → f32, add, accumulate SSQ
+          unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+          unsigned r1 = res_packed.x & 0xFFFF0000u;
+          unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+          unsigned r3 = res_packed.y & 0xFFFF0000u;
+          float rv0, rv1, rv2, rv3;
+          __builtin_memcpy(&rv0, &r0, 4);
+          __builtin_memcpy(&rv1, &r1, 4);
+          __builtin_memcpy(&rv2, &r2, 4);
+          __builtin_memcpy(&rv3, &r3, 4);
+
+          float s0 = ws4.x + rv0;
+          float s1 = ws4.y + rv1;
+          float s2 = ws4.z + rv2;
+          float s3 = ws4.w + rv3;
+
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+
+          // Cache resadd sums in registers for Pass 2 (avoid re-reading x_out)
+          s_cache[n_cached + 0] = s0;
+          s_cache[n_cached + 1] = s1;
+          s_cache[n_cached + 2] = s2;
+          s_cache[n_cached + 3] = s3;
+          n_cached += _VEC;
+
+          // Pack 4 bf16 output and store as uint2 (flat_store_dwordx2)
+          unsigned short o0 = _gang_float_to_bf16(s0);
+          unsigned short o1 = _gang_float_to_bf16(s1);
+          unsigned short o2 = _gang_float_to_bf16(s2);
+          unsigned short o3 = _gang_float_to_bf16(s3);
+          uint2 out_packed;
+          out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+          out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+          MPK_XOUT_STORE(xout_base + off, out_packed);
+        }
+      }
+
+// Wavefront reduction
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        ssq += __shfl_xor(ssq, offset);
+      }
+      #endif
+
+      // Cross-wave reduction via shared memory
+      float *s_red = (float *)_rnlm_smem;
+      int _wave_id = tid >> 6;
+      int _lane_id = tid & 63;
+      int _num_waves = blockDim.x >> 6;
+      if (_lane_id == 0) {
+        s_red[_wave_id] = ssq;
+      }
+      __syncthreads();
+
+      float rms_rcp;
+      if (_wave_id == 0) {
+        ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+        for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
+          ssq += __shfl_xor(ssq, offset);
+        }
+        if (_lane_id == 0) {
+          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        }
+      }
+      __syncthreads();
+      rms_rcp = s_red[0];
+
+      // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
+      {
+        using bf16 = __hip_bfloat16;
+        constexpr int VEC = 4;
+        bf16 const *w_in = (bf16 const *)d_norm_w;
+        bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
+        int ci = 0;
+#pragma unroll
+        for (int off = tid * VEC; off < REDUCTION_SIZE; off += _BLOCK_VEC) {
+          uint64_t wv;
+          __builtin_memcpy(&wv, &w_in[off], 8);
+          bf16 const *wa = (bf16 const *)&wv;
+          bf16 ov[VEC];
+#pragma unroll
+          for (int j = 0; j < VEC; j++) {
+            ov[j] = __float2bfloat16(s_cache[ci + j] * rms_rcp *
+                                     __bfloat162float(wa[j]));
+          }
+          __builtin_memcpy(&out[off], ov, 8);
+          ci += VEC;
+        }
+      }
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+  __syncthreads();
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+    _sp_t2 = _sp_t1;
+  }
+#endif
+  // ── Tile dispatch ───────────────────────────────────────────────────────
+  int tok_idx = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+
+  if (tok_idx >= batch_count) {
+    return;
+  }
+
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Step 2: Quantize/copy BF16 input to LDS ────────────────────────────
+  unsigned short const *input_row =
+      (unsigned short const *)norm_scratch_ptr + tok_idx * REDUCTION_SIZE;
+  _gang_wave_parallel_fp8_quant<REDUCTION_SIZE>(
+      input_row, s_tok_fp8, s_tok_scales);
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  // ── Step 3+4: MFMA + bias epilogue ─────────────────────────────────────
+  if constexpr (OUTPUT_PER_WG >= 64) {
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+      int wave_tile = warp_id + tile_iter * NUM_WAVES;
+      int w_row = wave_tile * 16 + col;
+
+      int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+      int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+      f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+      i32x8_t a0 =
+          *(i32x8_t const *)(wg_data + row_data_base + 0 * 64 + g * 16);
+      int sa0 = (int)wg_scales[row_scale_base + 0 * 4 + g];
+      i32x8_t a1 =
+          *(i32x8_t const *)(wg_data + row_data_base + 1 * 64 + g * 16);
+      int sa1 = (int)wg_scales[row_scale_base + 1 * 4 + g];
+      i32x8_t a2 =
+          *(i32x8_t const *)(wg_data + row_data_base + 2 * 64 + g * 16);
+      int sa2 = (int)wg_scales[row_scale_base + 2 * 4 + g];
+      i32x8_t a3 =
+          *(i32x8_t const *)(wg_data + row_data_base + 3 * 64 + g * 16);
+      int sa3 = (int)wg_scales[row_scale_base + 3 * 4 + g];
+
+#pragma unroll 1
+      for (int ki = 0; ki < MFMA_ITERS; ki += 4) {
+        {
+          i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki];
+          acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+        }
+        if (ki + 4 < MFMA_ITERS) {
+          int kt4 = (ki + 4) * K_PER_MFMA;
+          a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+          sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+        }
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 1];
+          acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+        }
+        if (ki + 5 < MFMA_ITERS) {
+          int kt5 = (ki + 5) * K_PER_MFMA;
+          a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+          sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+        }
+        {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 2];
+          acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+        }
+        if (ki + 6 < MFMA_ITERS) {
+          int kt6 = (ki + 6) * K_PER_MFMA;
+          a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+          sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+        }
+        if (ki + 3 < MFMA_ITERS) {
+          i32x8_t b =
+              _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+          int sb = (int)s_tok_scales[ki + 3];
+          acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+        }
+        if (ki + 7 < MFMA_ITERS) {
+          int kt7 = (ki + 7) * K_PER_MFMA;
+          a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+          sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+        }
+      }
+
+      if (col == 0) {
+        for (int i = 0; i < 4; i++) {
+          int out_n = wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4 + i;
+          float sum = acc[i];
+
+          unsigned bt = (unsigned)d_bias[out_n] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+
+          int out_idx = tok_idx * output_stride + out_n;
+          d_qkv_output[out_idx] = _gang_float_to_bf16(sum + bv);
+        }
+      }
+    }
+  } else {
+    // K-parallel path: depth-4 pipelined
+    constexpr int TOTAL_K_ITERS = MFMA_ITERS;
+    constexpr int ITERS_PER_WAVE = TOTAL_K_ITERS / NUM_WAVES;
+    static_assert(TOTAL_K_ITERS % NUM_WAVES == 0,
+                  "MFMA_ITERS must be divisible by NUM_WAVES for K-parallel");
+    static_assert(ITERS_PER_WAVE >= 4,
+                  "Depth-4 K-parallel requires ITERS_PER_WAVE >= 4");
+
+    int const ki_start = warp_id * ITERS_PER_WAVE;
+    int const ki_end = ki_start + ITERS_PER_WAVE;
+
+    int w_row = col;
+    int const row_data_base = w_row * (REDUCTION_SIZE / 2);
+    int const row_scale_base = w_row * NUM_BLOCKS_32;
+
+    f32x4_t acc = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    i32x8_t a0 =
+        *(i32x8_t const *)(wg_data + row_data_base + ki_start * 64 + g * 16);
+    int sa0 = (int)wg_scales[row_scale_base + ki_start * 4 + g];
+    i32x8_t a1 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 1) * 64 + g * 16);
+    int sa1 = (int)wg_scales[row_scale_base + (ki_start + 1) * 4 + g];
+    i32x8_t a2 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 2) * 64 + g * 16);
+    int sa2 = (int)wg_scales[row_scale_base + (ki_start + 2) * 4 + g];
+    i32x8_t a3 = *(i32x8_t const *)(wg_data + row_data_base +
+                                    (ki_start + 3) * 64 + g * 16);
+    int sa3 = (int)wg_scales[row_scale_base + (ki_start + 3) * 4 + g];
+
+#pragma unroll 1
+    for (int ki = ki_start; ki < ki_end; ki += 4) {
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, ki * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki];
+        acc = _gang_mfma_f4xf8(a0, b, acc, sa0, sb);
+      }
+      if (ki + 4 < ki_end) {
+        int kt4 = (ki + 4) * K_PER_MFMA;
+        a0 = *(i32x8_t const *)(wg_data + row_data_base + kt4 / 2 + g * 16);
+        sa0 = (int)wg_scales[row_scale_base + kt4 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 1) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 1];
+        acc = _gang_mfma_f4xf8(a1, b, acc, sa1, sb);
+      }
+      if (ki + 5 < ki_end) {
+        int kt5 = (ki + 5) * K_PER_MFMA;
+        a1 = *(i32x8_t const *)(wg_data + row_data_base + kt5 / 2 + g * 16);
+        sa1 = (int)wg_scales[row_scale_base + kt5 / 32 + g];
+      }
+
+      {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 2) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 2];
+        acc = _gang_mfma_f4xf8(a2, b, acc, sa2, sb);
+      }
+      if (ki + 6 < ki_end) {
+        int kt6 = (ki + 6) * K_PER_MFMA;
+        a2 = *(i32x8_t const *)(wg_data + row_data_base + kt6 / 2 + g * 16);
+        sa2 = (int)wg_scales[row_scale_base + kt6 / 32 + g];
+      }
+
+      if (ki + 3 < ki_end) {
+        i32x8_t b = _gang_load_fp8_mfma_b(s_tok_fp8, (ki + 3) * K_PER_MFMA, g);
+        int sb = (int)s_tok_scales[ki + 3];
+        acc = _gang_mfma_f4xf8(a3, b, acc, sa3, sb);
+      }
+      if (ki + 7 < ki_end) {
+        int kt7 = (ki + 7) * K_PER_MFMA;
+        a3 = *(i32x8_t const *)(wg_data + row_data_base + kt7 / 2 + g * 16);
+        sa3 = (int)wg_scales[row_scale_base + kt7 / 32 + g];
+      }
+    }
+
+    float *lds_reduce = (float *)_rnlm_smem;
+    if (col == 0) {
+      for (int i = 0; i < 4; i++) {
+        lds_reduce[warp_id * OUTPUT_PER_WG + g * 4 + i] = acc[i];
+      }
+    }
+    __syncthreads();
+
+    if (warp_id == 0 && col == 0) {
+      for (int i = 0; i < 4; i++) {
+        float v = 0.0f;
+        for (int w = 0; w < NUM_WAVES; w++) {
+          v += lds_reduce[w * OUTPUT_PER_WG + g * 4 + i];
+        }
+
+        int out_n = wg_idx * OUTPUT_PER_WG + g * 4 + i;
+
+        unsigned bt = (unsigned)d_bias[out_n] << 16;
+        float bv;
+        __builtin_memcpy(&bv, &bt, 4);
+
+        int out_idx = tok_idx * output_stride + out_n;
+        d_qkv_output[out_idx] = _gang_float_to_bf16(v + bv);
+      }
+    }
+  }
+
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // Every (token, slot, hidden) element is assigned by exactly one W2 tile per
+  // layer, so nothing stale survives and there is nothing to clear. The old
+  // per-token layout needed this pass because it accumulated with atomicAdd.
+  // See moe_ws_layout.cuh.
+
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t4 = __builtin_amdgcn_s_memrealtime();
+    // Slot 0: QKV. [0]=Fused ResAddF32+RMSNorm [1]=0 (fused) [2]=FP8Quant
+    // [3]=MFMA+Epi
+    atomicAdd(&g_subphase_ns[0][0], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[0][1], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[0][2], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_ns[0][3], (_sp_t4 - _sp_t3) * 10);
+    atomicAdd(&g_subphase_cnt[0], 1ULL);
+  }
+#endif
+  __syncthreads();
+}
+
+// ── KVUpd variant: ResAddF32 + RMSNorm + MXFP4 + KV Cache Update ───────
+#ifdef MPK_QKV_EPI_PRELOAD
+// _kvupd_rope_epilogue_packed with its two loads supplied by the caller:
+// bias4_pre is this lane's bias[wg_idx*OPW + wave_tile*16 + g*4 .. +3] and
+// cos_pre/sin_pre are cos/sin[pos][tid] (read by threads tid < HEAD_DIM/2).
+template <int HEAD_DIM, int TOK_ROWS>
+__device__ __forceinline__ void _kvupd_rope_epilogue_packed_pre(
+    float const *acc, uint64_t bias4_pre, unsigned cos_pre, unsigned sin_pre,
+    int wave_tile, int g, int col, int tid, bool tok_active, int n_valid,
+    unsigned short *dst, int dst_stride, int tok_row_base, int head_offset,
+    unsigned short *s_rope) {
+  static_assert(TOK_ROWS == 1, "MPK_QKV_EPI_PRELOAD is the batch-1 epilogue");
+  if (tok_active) {
+    int d0 = wave_tile * 16 + g * 4;
+    unsigned short const *b4 = (unsigned short const *)&bias4_pre;
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+      unsigned bt = (unsigned)b4[i] << 16;
+      float bv;
+      __builtin_memcpy(&bv, &bt, 4);
+      s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+    }
+  }
+  __syncthreads();
+  constexpr int HALF = HEAD_DIM / 2;
+  if (tid < HALF && n_valid > 0) {
+    int const d = tid;
+    unsigned short *row = s_rope;
+    unsigned v0_bits = (unsigned)row[d] << 16;
+    unsigned v1_bits = (unsigned)row[d + HALF] << 16;
+    float v0, v1;
+    __builtin_memcpy(&v0, &v0_bits, 4);
+    __builtin_memcpy(&v1, &v1_bits, 4);
+    unsigned c_bits = (cos_pre & 0xFFFFu) << 16;
+    unsigned s_bits = (sin_pre & 0xFFFFu) << 16;
+    float c, s;
+    __builtin_memcpy(&c, &c_bits, 4);
+    __builtin_memcpy(&s, &s_bits, 4);
+    row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+    row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+  }
+  __syncthreads();
+#ifdef MPK_ROPE_VEC_STORE
+  for (int idx = (int)tid * 4; idx < HEAD_DIM; idx += 256 * 4) {
+    if (n_valid <= 0) {
+      continue;
+    }
+    unsigned long long packed;
+    __builtin_memcpy(&packed, &s_rope[idx], 8);
+    st_wt_u64(&dst[(long long)tok_row_base * dst_stride + head_offset + idx],
+              packed);
+  }
+#else
+  for (int idx = tid; idx < HEAD_DIM; idx += 256) {
+    if (n_valid <= 0) {
+      continue;
+    }
+    dst[(long long)tok_row_base * dst_stride + head_offset + idx] = s_rope[idx];
+  }
+#endif
+}
+#endif
+
+// Replaces gang_mulsumradd_rmsnorm_linear_mxfp4_bias_kvupd_kernel for layers
+// 1+.
+template <int BATCH_SIZE,
+          int OUTPUT_PER_WG,
+          int REDUCTION_SIZE,
+          int ACTUAL_HIDDEN_DIM,
+          int HEAD_DIM,
+          int NUM_Q_PER_KV,
+          int PAGE_SIZE>
+#ifdef MPK_QKV_INLINE
+__device__ __forceinline__ void
+#else
+__device__ __noinline__ void
+#endif
+    gang_resaddf32_rmsnorm_linear_mxfp4_bias_kvupd_kernel(
+        void *workspace_f32_ptr,  // [batch, REDUCTION_SIZE] f32 (read + zero)
+        void const *residual_ptr, // [batch, REDUCTION_SIZE] bf16
+        void const *norm_weight_ptr, // [REDUCTION_SIZE] bf16
+        void *norm_scratch_ptr,      // [batch, REDUCTION_SIZE] bf16
+        void const *weight_ptr,      // [n_wgs_per_xcd, wg_bytes] packed MXFP4
+        void const *bias_ptr,        // [1, output_size_per_xcd] bf16
+        void *x_output_ptr,          // [batch, REDUCTION_SIZE] bf16
+        void *k_cache_ptr,
+        void *v_cache_ptr,
+        void *q_workspace_ptr,
+        void const *cos_ptr,
+        void const *sin_ptr,
+        int const *qo_indptr,
+        int const *kv_indptr,
+        int const *kv_indices,
+        int const *kv_last_page_len,
+        int num_active_tokens,
+        int n_wgs_per_xcd,
+        int kv_stride,
+        int q_ws_stride,
+        int tile_idx,
+        // True when the fused layer already staged this exact tile's weights
+        // into this exact LDS region during the previous layer's Phase 9
+        // barrier spin. Defaulted so the standalone generated variant and the
+        // layer-0 / world_size>1 caller need no change.
+        bool weights_preloaded = false
+#ifdef MPK_QKV_POS_CACHE
+#ifdef MPK_QKV_KSPLIT
+#error "MPK_QKV_POS_CACHE: not wired for MPK_QKV_KSPLIT"
+#endif
+        // 0: compute the KV slot; 1: compute and keep it (a token's first
+        // layer); 2: reuse the kept one (its other layers).
+        ,
+        int pos_cache = 0
+#endif
+#ifdef MPK_QKV_KSPLIT
+        // 0 = K-lo (iters [0, K_LO)), 1 = K-hi (iters [K_LO, MFMA_ITERS)).
+        // Default 0 so callers that have not opted in keep the full K-range.
+        ,
+        int k_part = 0
+#endif
+#ifdef MPK_QKV_KV_SHARED_ROW
+        // > 0: this layer's qkv epoch; Q tile 0 publishes the quantized
+        // row under it and the K/V tiles take it. 0: every tile norms.
+        ,
+        int kv_row_epoch = 0
+#endif
+#if defined(MPK_VT2) && defined(MPK_VT2_QKV)
+#if defined(MPK_QKV_POS_CACHE) || defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_KV_SHARED_ROW)
+#error "MPK_VT2_QKV: tok_off follows weights_preloaded directly"
+#endif
+        ,
+        int tok_off = 0  // absolute token index of row 0 (VT2: one call per token)
+#ifdef MPK_VTN_QROW
+        ,
+        int kv_row_epoch = 0,  // > 0 with qrow_role: this layer's qkv epoch
+        int qrow_role = 0      // 1: publish the quantized row, 2: take it instead of fold + norm
+#ifdef MPK_VTN_QPAIR
+        ,
+        int tok_off2 = -1  // >= 0 on a take: a second token, run as MFMA column 1
+#ifdef MPK_VTN_QTRI
+        ,
+        int tok_off3 = -1  // >= 0 (with tok_off2) on a round-0 fold: a third token, MFMA column 2
+#endif
+#endif
+#endif
+#define MPK_QKV_TOK_OFF tok_off +
+#else
+#define MPK_QKV_TOK_OFF
+#endif
+        ) {
+
+  static_assert(OUTPUT_PER_WG % 16 == 0);
+  static_assert(REDUCTION_SIZE % 128 == 0);
+  static_assert(OUTPUT_PER_WG == HEAD_DIM,
+                "KV_UPD fusion requires OUTPUT_PER_WG == HEAD_DIM");
+
+  constexpr int NUM_BLOCKS_32 = REDUCTION_SIZE / 32;
+  constexpr int WG_DATA_BYTES = OUTPUT_PER_WG * (REDUCTION_SIZE / 2);
+  constexpr int WG_SCALE_BYTES = OUTPUT_PER_WG * NUM_BLOCKS_32;
+  constexpr int WG_BYTES = WG_DATA_BYTES + WG_SCALE_BYTES;
+  constexpr int K_PER_MFMA = 128;
+  constexpr int MFMA_ITERS = REDUCTION_SIZE / K_PER_MFMA;
+  constexpr int NUM_WAVES = 4;
+  constexpr int TILES_PER_WAVE = OUTPUT_PER_WG / 16 / NUM_WAVES;
+
+  // ── Token activation in shared memory (N-axis packed) ────────────────────
+  // The MFMA is 16x16x128: 16 weight rows x 16 token columns. Staging token
+  // `col` at LDS row `col` gives lane (g, col) its own token's B operand, so
+  // one tile now covers up to 16 batch rows for the same MFMA count and the
+  // same weight traffic. See _gang_multirow_fp8_quant for the layout contract.
+  constexpr int MFMA_N = 16;
+  constexpr int TOK_ROWS = BATCH_SIZE < MFMA_N ? BATCH_SIZE : MFMA_N;
+  constexpr int NUM_BBLK = (BATCH_SIZE + TOK_ROWS - 1) / TOK_ROWS;
+#ifdef MPK_QKV_KSPLIT
+  static_assert(TOK_ROWS == 1,
+                "MPK_QKV_KSPLIT is the TOK_ROWS==1 decode window only");
+  static_assert(TILES_PER_WAVE == 1,
+                "MPK_QKV_KSPLIT assumes one tile per wave (OUTPUT_PER_WG==64)");
+#ifdef MPK_QKV_MFMA_UNROLLED
+#error "MPK_QKV_KSPLIT is incompatible with MPK_QKV_MFMA_UNROLLED"
+#endif
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+#ifndef MPK_QKV_KSPLIT
+#error "MPK_QKV_KSPLIT_SHARED_NORM requires MPK_QKV_KSPLIT"
+#endif
+#endif
+  // Odd MFMA_ITERS (23) splits 12 + 11. Even nki exits via QKV_TAIL_B1,
+  // odd nki via the bank-0 tail — both already exist in the branching loop.
+  constexpr int K_LO = (MFMA_ITERS + 1) / 2;
+  int const k_iter0 = k_part ? K_LO : 0;
+  int const nki = k_part ? (MFMA_ITERS - K_LO) : K_LO;
+  int const iters_m1_val = nki - 1;
+#endif
+
+  // The +16 pad is load-bearing, not alignment slack. At ds_read_b128
+  // granularity lane `col` lands in bank group (col * TOK_ROW_STRIDE/16) % 8;
+  // with 2960 that is (col*185) % 8 and 185 % 8 == 1, so the 16 lanes spread
+  // over all 8 groups. Unpadded 2944 collapses them onto one group.
+  constexpr int TOK_ROW_STRIDE = REDUCTION_SIZE + 16;
+  constexpr int SC_STRIDE = ((MFMA_ITERS + 3) / 4) * 4;
+  constexpr int TOK_REGION = TOK_ROWS * TOK_ROW_STRIDE;
+  constexpr int SC_REGION = TOK_ROWS * SC_STRIDE;
+
+  uint8_t const *W = (uint8_t const *)weight_ptr;
+  unsigned short const *d_bias = (unsigned short const *)bias_ptr;
+
+  // The geometry lives in QkvWeightLds so the fused layer's Phase 9 prefetch
+  // (which stages the NEXT layer's weights into this same region during the
+  // barrier spin) cannot drift from what the MFMA below reads. It is also the
+  // single owner of the low-LDS offsets, so declare it before the first
+  // pointer that depends on one.
+  using G = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+
+  extern __shared__ char _rnlm_smem[];
+  uint8_t *s_tok_fp8 = (uint8_t *)_rnlm_smem + G::TOK_OFF;
+  uint8_t *s_tok_scales = s_tok_fp8 + TOK_REGION;
+
+  int const tid = MPK_TIDX_Q;
+  int const warp_id = tid >> 6;
+  int const lane_id = tid & 63;
+  int const col = lane_id & 15;
+  int const g = lane_id >> 4;
+
+  MPK_QKVSUB(0);
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+  // One request: its KV position metadata depends on nothing this kernel
+  // computes, so load it here and let the slab pass cover the latency.
+#if MPK_QKV_PF_VSLOT
+  int const pf_rq = MPK_QKV_TOK_OFF 0;
+#else
+  constexpr int pf_rq = 0;
+#endif
+  int const pf_qo0 = qo_indptr[pf_rq];
+  int const pf_qo1 = qo_indptr[pf_rq + 1];
+  int const pf_kv0 = kv_indptr[pf_rq];
+  int const pf_kv1 = kv_indptr[pf_rq + 1];
+  int const pf_lpl = kv_last_page_len[pf_rq];
+  int pf_gp = 0;
+  int pf_page = 0;
+#endif
+#ifdef MPK_VTN_QPAIR
+#if !defined(MPK_VTN_QMP) || !defined(MPK_QKV_POS_PREFETCH) || !MPK_QKV_PF_VSLOT || \
+    !defined(MPK_QKV_ROPE_REG) || !defined(MPK_QKV_LDS_NORM) || defined(MPK_QKV_EPI_PF) || \
+    defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_KV_SPREAD) || defined(MPK_QKV_KSPLIT) || \
+    defined(MPK_QKV_PF3)
+#error "MPK_VTN_QPAIR: QMP takes, virtual-slot position prefetch, RoPE in registers, LDS norm block"
+#endif
+  bool const qpair = tok_off2 >= 0;
+  int const pf2_rq = qpair ? tok_off2 : pf_rq;
+#define MPK_QPAIR_DQ (tok_off2 - tok_off)
+  int const pf2_qo0 = qo_indptr[pf2_rq];
+  int const pf2_qo1 = qo_indptr[pf2_rq + 1];
+  int const pf2_kv0 = kv_indptr[pf2_rq];
+  int const pf2_kv1 = kv_indptr[pf2_rq + 1];
+  int const pf2_lpl = kv_last_page_len[pf2_rq];
+  int pf2_gp = 0;
+  int pf2_page = 0;
+  // The second row lives in the LDS norm block, which a take call never uses.
+  static_assert(G::NORM_BYTES >= TOK_ROW_STRIDE + SC_STRIDE, "MPK_VTN_QPAIR: second row in the norm block");
+  uint8_t *const s_tok2 = (uint8_t *)_rnlm_smem + G::NORM_OFF;
+  uint8_t *const s_tsc2 = s_tok2 + TOK_ROW_STRIDE;
+#ifdef MPK_VTN_QTRI
+#if !defined(MPK_VTN_T) || MPK_VTN_T > 9 || defined(MPK_QKV_W_TOP)
+#error "MPK_VTN_QTRI: a third column only on round-0 folds (T <= 9), third row above the default weight region"
+#endif
+  bool const qtri = tok_off3 >= 0;
+  int const pf3_rq = qtri ? tok_off3 : pf_rq;
+#undef MPK_QPAIR_DQ
+#define MPK_QPAIR_DQ (pcol == 2 ? tok_off3 - tok_off : tok_off2 - tok_off)
+  int const pf3_qo0 = qo_indptr[pf3_rq];
+  int const pf3_qo1 = qo_indptr[pf3_rq + 1];
+  int const pf3_kv0 = kv_indptr[pf3_rq];
+  int const pf3_kv1 = kv_indptr[pf3_rq + 1];
+  int const pf3_lpl = kv_last_page_len[pf3_rq];
+  int pf3_gp = 0;
+  int pf3_page = 0;
+  // The third row sits above the weights, where only the fold's slab staging lives; the fold path writes it
+  // after the quant, when the slabs are consumed.
+  static_assert(G::W_END + TOK_ROW_STRIDE + SC_STRIDE <=
+                    mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                        mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "MPK_VTN_QTRI: third row above the weights");
+  uint8_t *const s_tok3 = (uint8_t *)_rnlm_smem + G::W_END;
+  uint8_t *const s_tsc3 = s_tok3 + TOK_ROW_STRIDE;
+#endif
+#endif
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  unsigned long long _sp_t0 = 0, _sp_t1 = 0, _sp_t2 = 0, _sp_t3 = 0,
+                     _sp_t3b = 0, _sp_t4 = 0;
+  bool _sp_rec = (tile_idx == 0 && tid == 0 && g_subphase_active);
+  if (_sp_rec) {
+    _sp_t0 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+  MPK_QKVK_MARK(0);
+#ifdef MPK_QT_TS
+  unsigned int qt_t[4] = {0u, 0u, 0u, 0u};  // MPK_QT_TS (timing tool)
+  qt_t[0] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+  int batch_count =
+      (num_active_tokens < BATCH_SIZE) ? num_active_tokens : BATCH_SIZE;
+
+  // Tile space is now (column block, weight group) instead of (token, weight
+  // group): the token axis moved into the MFMA's N dimension, so the host
+  // emits n_bblk * n_wgs_per_xcd tiles rather than batch_size * n_wgs_per_xcd.
+  int bblk = tile_idx / n_wgs_per_xcd;
+  int wg_idx = tile_idx % n_wgs_per_xcd;
+  int tok_row_base = bblk * MFMA_N;
+  int tok_row = tok_row_base + col;
+#ifdef MPK_QKV_EPI_PF
+  static_assert(TILES_PER_WAVE == 1, "MPK_QKV_EPI_PF: one output tile per wave");
+  // This lane's epilogue bias quad (d0 = warp_id * 16 + g * 4), issued now so
+  // it lands during the fold. Typed AS(1): a generic load is FLAT and would
+  // turn every fold wait into vmcnt(0).
+  _gl_u32x2 const epi_bias_pf =
+      *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+          d_bias + wg_idx * OUTPUT_PER_WG + warp_id * 16 + g * 4);
+#endif
+
+  uint8_t const *wg_data = W + static_cast<int64_t>(wg_idx) * WG_BYTES;
+  uint8_t const *wg_scales = wg_data + WG_DATA_BYTES;
+
+  // ── Phase A: Issue HBM→LDS weight prefetch BEFORE RMSNorm ─────────────
+  constexpr int QKV_TILE_SCALE = G::TILE_SCALE;
+  constexpr int QKV_TILE_DATA_PADDED = G::TILE_DATA_PADDED;
+  constexpr int QKV_TILE_BYTES = G::TILE_BYTES;
+  constexpr int QKV_LDS_OFF = G::W_OFF;
+
+  // The real budget is 155 KB minus AMD's 3 KB reserve minus the layer-index
+  // word the fused wrapper parks at the top; the old 155*1024 bound was
+  // permissive by 3 KB.
+  static_assert(G::W_END <= mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                "QKV LDS weights exceed MI350X LDS budget (if you just set "
+                "MPK_QKV_LDS_NORM: it costs TOK_ROWS * REDUCTION_SIZE * 2 "
+                "extra bytes, which only fits at small TOK_ROWS)");
+  // The shared geometry must agree with this kernel's own token-region math,
+  // or the DMA writes where one says and the MFMA reads where the other says.
+  static_assert(G::TOK_REGION == TOK_REGION && G::SC_REGION == SC_REGION,
+                "QkvWeightLds token region disagrees with kvupd kernel");
+  // RoPE reuses the token region, which is dead once the MFMA has retired.
+  static_assert(TOK_ROWS * HEAD_DIM * 2 <= TOK_REGION,
+                "packed RoPE scratch must fit in the dead token region");
+  uint8_t *qkv_lds_w = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
+
+  // ── Optional: keep the normalized activation in LDS ────────────────────
+  //
+  // Step 1 computes the RMSNorm redundantly in every block and Step 2 in the
+  // *same* block reads it straight back, so the global round trip through
+  // norm_scratch_ptr carries no information between workgroups. Under
+  // MPK_QKV_LDS_NORM the row lands in LDS instead and never leaves the CU.
+  //
+  // Only the TOK_ROWS rows this column block actually quantizes are staged;
+  // rows outside [tok_row_base, tok_row_base + TOK_ROWS) are still normalized
+  // (the loop below also writes x_output for them, which *is* a real global
+  // output) but their norm result is dropped on the floor, exactly as the
+  // global path's redundant writers overwrote each other.
+  //
+  // Hazard note: an equivalent LDS-norm path is known to miscompile on
+  // Clang 23 -- intermittent invalid decode tokens when a batched quantum
+  // drains to concurrency one. This tree builds with AMD clang 20, which is
+  // not affected; if you move to a newer compiler, re-validate before
+  // trusting this flag.
+#ifdef MPK_QKV_LDS_NORM
+  static_assert(G::NORM_OFF >= G::RED_BYTES,
+                "the RMSNorm cross-wave scratch must not overlap the norm "
+                "buffer: the batch loop reuses s_red for row b after pass 2 "
+                "has already written row b-1");
+  unsigned short *s_norm_out =
+      (unsigned short *)((uint8_t *)_rnlm_smem + G::NORM_OFF);
+#endif
+
+  // MPK_ABLATE_QKV_DMA: timing-only upper bound on what any prefetch hoist
+  // could recover. Skipping the load leaves garbage weights in LDS, so the
+  // numerics are meaningless -- but it is safe to run (the garbage stays in
+  // the data path; every address comes from host-built index tables) and the
+  // wall clock is the honest ceiling for hiding this DMA perfectly.
+  // Measured 2.422 vs 2.486/2.491 ms at B=1 seq512: 64 us, 2.6%.
+#ifndef MPK_ABLATE_QKV_DMA
+#ifdef MPK_QKV_DMA_IN_SLAB
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_QKV_KSPLIT_SHARED_NORM) || !defined(MPK_QKV_PF_SKIP_W2)
+#error "MPK_QKV_DMA_IN_SLAB is wired for the unsplit kernel with MPK_QKV_PF_SKIP_W2"
+#endif
+  // Batch 1: the weight DMA is issued inside the slab pass instead, after the
+  // slab loads and before their use.
+  bool const mpk_slab_dma = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_slab_dma) {
+#elif defined(MPK_QKV_WDMA_MID)
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_PF_SKIP_W2) ||               \
+    !defined(MPK_QKV_RED_LDS_BAR) || !defined(MPK_QKV_NQ_FUSED2) ||            \
+    defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) ||                       \
+    defined(MPK_QKV_WDMA_AFTER_SLAB) || defined(MPK_QKV_SLAB_LDS_SHADOW) ||    \
+    defined(MPK_QKV_SLAB_LDS_NODMA)
+#error "MPK_QKV_WDMA_MID needs MPK_QKV_SLAB_LDS, MPK_QKV_PF_SKIP_W2, MPK_QKV_RED_LDS_BAR and MPK_QKV_NQ_FUSED2"
+#endif
+  // Batch 1: issued inside the slab pass, after iteration 0's loads (see the SLAB_LDS block).
+  bool const mpk_wdma_mid = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_wdma_mid) {
+#elif defined(MPK_QKV_WDMA_AFTER_SLAB)
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_PF_SKIP_W2) || \
+    !defined(MPK_QKV_RED_LDS_BAR) || defined(MPK_QKV_KSPLIT) || \
+    defined(MPK_KV_SPREAD)
+#error "MPK_QKV_WDMA_AFTER_SLAB needs MPK_QKV_SLAB_LDS, MPK_QKV_PF_SKIP_W2 and MPK_QKV_RED_LDS_BAR"
+#endif
+  // Batch 1: issued after the slab pass instead (see the SLAB_LDS block), so
+  // the slab loads do not retire behind it.
+  bool const mpk_wdma_late = !weights_preloaded && BATCH_SIZE == 1;
+  if (!weights_preloaded && !mpk_wdma_late) {
+#else
+  if (!weights_preloaded) {
+#endif
+    qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+        weight_ptr,
+        n_wgs_per_xcd,
+        tile_idx
+#ifdef MPK_QKV_KSPLIT
+        ,
+        k_iter0,
+        nki
+#endif
+    );
+#ifdef MPK_KV_SPREAD
+    if (tile_idx % n_wgs_per_xcd < NUM_Q_PER_KV) {
+      qkv_prefetch_kv_extra_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE,
+                                NUM_Q_PER_KV>(weight_ptr, n_wgs_per_xcd,
+                                              tile_idx);
+    }
+#endif
+  }
+#endif
+
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+  static_assert(TOK_REGION + SC_REGION <= MPK_QKV_KSPLIT_TOK_BYTES,
+                "token publish blob exceeds g_qkv_kpart_tok slot");
+  if (k_part == 1) {
+    // k_part 0 owns RMSNorm+quant and publishes the fp8 row; k_part 1 only
+    // waits and copies it into LDS. Same-XCD: producer write-through +
+    // waitcnt, consumer vL1 invalidate -- not buffer_inv sc1, which would
+    // drop this XCD's L2 (the rejected K-split's handshake did that).
+    int const tok_slot =
+        _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+    uint8_t *tok_src =
+        &g_qkv_kpart_tok[tok_slot * MPK_QKV_KSPLIT_TOK_BYTES];
+    int *tok_ready = &g_qkv_kpart_tok_ready[tok_slot];
+    if (tid == 0) {
+      while (ld_sys_s32(tok_ready) < 1) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+      asm volatile("buffer_inv" ::: "memory");
+    }
+    __syncthreads();
+    constexpr int nbytes = TOK_REGION + SC_REGION;
+#pragma unroll 1
+    for (int off = tid * 8; off < nbytes; off += 256 * 8) {
+      unsigned long long v;
+      uint8_t *srcp = tok_src + off;
+      asm volatile("global_load_dwordx2 %0, %1, off nt\n"
+                   "s_waitcnt vmcnt(0)"
+                   : "=v"(v)
+                   : "v"(srcp)
+                   : "memory");
+      __builtin_memcpy(s_tok_fp8 + off, &v, 8);
+    }
+    __syncthreads();
+    if (tid == 0) {
+      st_wt_u32(tok_ready, 0u);
+    }
+  } else {
+#endif
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) || \
+    defined(MPK_QKV_WDMA_AFTER_SLAB) || defined(MPK_QKV_PF_PAGE_LATE)
+#error "MPK_QKV_KV_SHARED_ROW is wired for the unsplit batch-1 kernel"
+#endif
+  static_assert(TOK_ROWS == 1 &&
+                    TOK_REGION + SC_REGION <= MPK_QKV_KV_ROW_BYTES &&
+                    TOK_REGION + SC_REGION <= 2 * 256 * 8,
+                "MPK_QKV_KV_SHARED_ROW: one quantized row per slot");
+  // K/V tiles take the quantized row from Q tile 0 (see the publish
+  // after the quant): the row is the whole hidden vector, the same in
+  // every tile, and Q tile 0 reaches the gate ~1.6 us before the K/V
+  // tiles, which come from a W2 group.
+  int const kvr_slot = _kvupd_get_xcd_id() * 2 + (kv_row_epoch & 1);
+  if (MPK_QROW_TAKE) {
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+    {
+      int const num_pages = pf_kv1 - pf_kv0;
+      int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+      int const num_new_tokens = pf_qo1 - pf_qo0;
+      pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
+    }
+    pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
+#ifdef MPK_VTN_QPAIR
+    if (qpair) {
+      int const num_pages2 = pf2_kv1 - pf2_kv0;
+      int const global_seq_len2 = (num_pages2 - 1) * PAGE_SIZE + pf2_lpl;
+      int const num_new_tokens2 = pf2_qo1 - pf2_qo0;
+      pf2_gp = global_seq_len2 - num_new_tokens2 + (tok_off2 + tok_row_base - pf2_qo0);
+      pf2_page = kv_indices[pf2_kv0 + pf2_gp / PAGE_SIZE];
+    }
+#endif
+#ifdef MPK_VTN_QROW_TAG
+    {
+      // MPK_VTN_QROW_TAG: the row's 746 words as {word, epoch} in this AID's replica; one local round trip.
+      constexpr int kvr_nw = (TOK_REGION + SC_REGION) / 4;
+      static_assert((TOK_REGION + SC_REGION) % 4 == 0 && kvr_nw <= 3 * 256 && 2 * kvr_nw <= MPK_AID_QROW_SLOT_INTS,
+                    "MPK_VTN_QROW_TAG: three tagged words per thread in one slot");
+      int const qx = _kvupd_get_xcd_id();
+#ifdef MPK_VTN_QMP
+      // MPK_VTN_QMP: one slot per (die, parity, token) in this AID's NC scratch.
+      int const *const qt = g_aid_nc_rep[qx >> 2] + MPK_NC_QROW_INTS +
+                            (((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off) *
+                                MPK_NC_QROW_SLOT_INTS;
+#else
+      int const *const qt = g_aid_flag_rep[qx >> 2] + MPK_AID_QROW_BASE_INTS +
+                            ((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_AID_QROW_SLOT_INTS;
+#endif
+      bool const qv1 = tid + 256 < kvr_nw, qv2 = tid + 512 < kvr_nw;
+      unsigned const qtag = (unsigned)kv_row_epoch;
+      unsigned long long qw0 = 0ull, qw1 = 0ull, qw2 = 0ull;
+#ifdef MPK_VTN_QPAIR
+      if (qpair) {
+        // Both producers' rows in one tagged batch; the second row goes to the norm block.
+        int const *const qt2 = qt + (tok_off2 - tok_off) * MPK_NC_QROW_SLOT_INTS;
+        unsigned long long qx0 = 0ull, qx1 = 0ull, qx2 = 0ull;
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %6, off sc0 sc1\n"
+                       "global_load_dwordx2 %1, %7, off sc0 sc1\n"
+                       "global_load_dwordx2 %2, %8, off sc0 sc1\n"
+                       "global_load_dwordx2 %3, %9, off sc0 sc1\n"
+                       "global_load_dwordx2 %4, %10, off sc0 sc1\n"
+                       "global_load_dwordx2 %5, %11, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(qw0), "=&v"(qw1), "=&v"(qw2), "=&v"(qx0), "=&v"(qx1), "=&v"(qx2)
+                       : "v"(qt + 2 * tid), "v"(qt + 2 * (tid + 256)), "v"(qt + 2 * (tid + 512)),
+                         "v"(qt2 + 2 * tid), "v"(qt2 + 2 * (tid + 256)), "v"(qt2 + 2 * (tid + 512))
+                       : "memory");
+          if ((unsigned)(qw0 >> 32) == qtag && (!qv1 || (unsigned)(qw1 >> 32) == qtag) &&
+              (!qv2 || (unsigned)(qw2 >> 32) == qtag) && (unsigned)(qx0 >> 32) == qtag &&
+              (!qv1 || (unsigned)(qx1 >> 32) == qtag) && (!qv2 || (unsigned)(qx2 >> 32) == qtag)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+        ((uint32_t *)s_tok2)[tid] = (uint32_t)qx0;
+        if (qv1) ((uint32_t *)s_tok2)[tid + 256] = (uint32_t)qx1;
+        if (qv2) ((uint32_t *)s_tok2)[tid + 512] = (uint32_t)qx2;
+      } else
+#endif
+      while (true) {
+        asm volatile("global_load_dwordx2 %0, %3, off sc0 sc1\n"
+                     "global_load_dwordx2 %1, %4, off sc0 sc1\n"
+                     "global_load_dwordx2 %2, %5, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=&v"(qw0), "=&v"(qw1), "=&v"(qw2)
+                     : "v"(qt + 2 * tid), "v"(qt + 2 * (tid + 256)), "v"(qt + 2 * (tid + 512))
+                     : "memory");
+        if ((unsigned)(qw0 >> 32) == qtag && (!qv1 || (unsigned)(qw1 >> 32) == qtag) &&
+            (!qv2 || (unsigned)(qw2 >> 32) == qtag)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+#ifdef MPK_QT_TS
+      qt_t[1] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+      ((uint32_t *)s_tok_fp8)[tid] = (uint32_t)qw0;
+      if (qv1) ((uint32_t *)s_tok_fp8)[tid + 256] = (uint32_t)qw1;
+      if (qv2) ((uint32_t *)s_tok_fp8)[tid + 512] = (uint32_t)qw2;
+      __syncthreads();
+#ifdef MPK_QT_TS
+      qt_t[2] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+    }
+    if (false) {
+#endif
+    uint8_t *kvr_src = &g_qkv_kv_row[kvr_slot * MPK_QKV_KV_ROW_BYTES];
+    if (tid == 0) {
+      // Equality, not >=: a relaunch restarts the epoch while the slot
+      // still holds the last launch's value.
+      while (ld_sys_s32(&g_qkv_kv_row_epoch[kvr_slot * 16]) != kv_row_epoch) {
+        __builtin_amdgcn_s_sleep(1);
+      }
+    }
+    __syncthreads();
+    constexpr int kvr_nbytes = TOK_REGION + SC_REGION;
+    unsigned long long kvr0 = 0ull, kvr1 = 0ull;
+    asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                 : "=v"(kvr0)
+                 : "v"(kvr_src + tid * 8)
+                 : "memory");
+    if (tid * 8 + 2048 < kvr_nbytes) {
+      asm volatile("global_load_dwordx2 %0, %1, off sc0 sc1"
+                   : "=v"(kvr1)
+                   : "v"(kvr_src + tid * 8 + 2048)
+                   : "memory");
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    __builtin_memcpy(s_tok_fp8 + tid * 8, &kvr0, 8);
+    if (tid * 8 + 2048 < kvr_nbytes) {
+      __builtin_memcpy(s_tok_fp8 + tid * 8 + 2048, &kvr1, 8);
+    }
+    __syncthreads();
+#ifdef MPK_VTN_QROW_TAG
+    }
+#endif
+  } else {
+#endif
+  // ── Step 0+1 FUSED: ResAddF32 + RMSNorm ───────────────────────────────
+  {
+#if defined(MPK_WSF32_AID) && !defined(MPK_WSFC_READ_PRODUCER)
+    float *d_ws = (float *)workspace_f32_ptr +
+                  ((int)(kernel::mpk_prenorm_xcc() & 0x7) >=
+                           (MPK_NUM_XCDS / 2)
+                       ? MOE_WS_SLOTS * REDUCTION_SIZE
+                       : 0);
+#else
+    float *d_ws = (float *)workspace_f32_ptr;
+#endif
+#ifdef MPK_WSF32_REP
+    if (float *wsr = mpk_wsf32_rep((int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2))
+      d_ws = wsr;
+#endif
+    unsigned short const *d_residual = (unsigned short const *)residual_ptr;
+    unsigned short *d_x_out = (unsigned short *)x_output_ptr;
+    unsigned short const *d_norm_w = (unsigned short const *)norm_weight_ptr;
+#ifndef MPK_QKV_LDS_NORM
+    unsigned short *d_norm_out = (unsigned short *)norm_scratch_ptr;
+#endif
+
+    for (int b = 0; b < batch_count; b++) {
+      float ssq = 0.0f;
+      // Register cache: store resadd sums (f32) to avoid re-reading x_out in
+      // Pass 2
+      constexpr int _VEC = 4;
+      constexpr int _BLOCK_VEC = 256 * _VEC;
+      constexpr int _MAX_ITERS = (REDUCTION_SIZE + _BLOCK_VEC - 1) / _BLOCK_VEC;
+      float s_cache[_MAX_ITERS * _VEC];
+      // Pass 2's norm weights, hoisted ahead of the cross-wave reduction. See
+      // the issue loop below the pass-1 body for why.
+      uint64_t prefetched_norm_weights[_MAX_ITERS];
+      int n_cached = 0;
+#ifdef MPK_QKV_PRO_FAST
+      // Static gamma: issue before the fold so it lands during it.
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+#endif
+      {
+        constexpr int VEC = 4;
+        constexpr int BLOCK_VEC = 256 * VEC;
+        // address_space(1) -- GLOBAL, not generic FLAT. Both buffers are
+        // device-global tensors on every path here (the workspace is
+        // host-allocated, the residual is a model activation), so the cast is
+        // sound; what it buys is that these loads increment vmcnt only. As
+        // generic FLAT they bumped lgkmcnt as well, and the compiler then has
+        // no way to express "wait for the first two slabs but not the rest" --
+        // it must emit a full `s_waitcnt vmcnt(0) lgkmcnt(0)`. The pass-1 body
+        // had four of those, one per slab, so the MOE_WS_SLOTS fold ran fully
+        // serialized: issue, drain, add, issue, drain, add. With GLOBAL the
+        // waits become counted vmcnt(N) and the four slabs overlap.
+        //
+        // Same reasoning applies to the norm-weight prefetch below, with
+        // more force here, because this loop reads MOE_WS_SLOTS slabs where
+        // the single-slab shape reads one.
+        auto const *ws_base = (__attribute__((address_space(1))) float const *)(
+            d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE));
+#ifdef MPK_WS_SYS_LOAD
+        __amdgpu_buffer_rsrc_t const ws_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE))),
+            (short)0, MOE_WS_SLOTS * REDUCTION_SIZE * (int)sizeof(float),
+            0x00020000);
+        __amdgpu_buffer_rsrc_t const res_rs = __builtin_amdgcn_make_buffer_rsrc(
+            mpk_uniform_ptr((void *)(d_residual + b * REDUCTION_SIZE)), (short)0,
+            REDUCTION_SIZE * 2, 0x00020000);
+#endif
+        auto const *res_base =
+            (__attribute__((address_space(1))) unsigned short const *)(
+                d_residual + b * REDUCTION_SIZE);
+        unsigned short *xout_base = d_x_out + b * REDUCTION_SIZE;
+#ifdef MPK_QKV_GAMMA_LDS
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_GAMMA_EARLY)
+#error "MPK_QKV_GAMMA_LDS uses LDS slot NUM_WAVES and replaces the register prefetch"
+#endif
+        {
+          constexpr int GV = (REDUCTION_SIZE * 2) / 16;
+          static_assert((REDUCTION_SIZE * 2) % 16 == 0 &&
+#ifdef MPK_QKV_W_TOP
+                            true,  // gamma in the low norm block (NORMREG)
+#else
+                            G::W_END + ((GV + 255) / 256) * 4096 <=
+                                149 * 1024,
+#endif
+                        "MPK_QKV_GAMMA_LDS: norm weight must fit LDS slot NUM_WAVES");
+          i32x4_t const g_rsrc =
+              make_w_buffer_rsrc(d_norm_w, REDUCTION_SIZE * 2);
+#ifdef MPK_QKV_GAMMA_NORMREG
+#if !defined(MPK_QKV_LDS_NORM) || \
+    (MPK_MAX_NUM_BATCHED_TOKENS != 1 && !(defined(MPK_VT2) && defined(MPK_VT2_QKV)))
+#error "MPK_QKV_GAMMA_NORMREG stages the weight in the one-row LDS norm block"
+#endif
+#ifdef MPK_LDS_DST_S
+          int g_w;
+          asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(g_w) : "v"(tid >> 6));
+#else
+          int const g_w = tid >> 6;
+#endif
+          auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
+              (uint8_t *)s_norm_out + g_w * 1024);
+#else
+          auto *g_lds = (__attribute__((address_space(3))) uint32_t *)(
+              (uint8_t *)_rnlm_smem + G::W_END + (tid >> 6) * 1024);
+#endif
+#pragma unroll
+          for (int j = 0; j < (GV + 255) / 256; j++) {
+            int const gi = tid + j * 256;
+            int const gc = gi < GV ? gi : GV - 1;
+#ifdef MPK_QKV_GAMMA_NORMREG
+            if (gi < GV)
+#endif
+            __llvm_amdgcn_raw_buffer_load_lds(
+                g_rsrc,
+                (__attribute__((address_space(3))) uint32_t *)(
+                    (uint8_t __attribute__((address_space(3))) *)g_lds +
+                    j * 4096),
+                16, gc * 16, 0, 0, 0);
+          }
+        }
+#endif
+
+#ifdef MPK_WS_FARCOPY
+#ifdef MPK_WS_SYS_LOAD
+#error "MPK_WS_FARCOPY's redo loop does not handle MPK_WS_SYS_LOAD"
+#endif
+        float const fc_ssq0 = ssq;  // MPK_WSFC_V4
+        int const fc_nc0 = n_cached;
+#endif
+#ifdef MPK_QKV_LDS_POISON_HI
+        {
+          typedef unsigned _pz_u32x4 __attribute__((ext_vector_type(4)));
+          for (int o = MPK_QKV_LDS_POISON_LO + tid * 16;
+               o < MPK_QKV_LDS_POISON_HI; o += 256 * 16)
+            *(__attribute__((address_space(3))) _pz_u32x4 *)(
+                (uint8_t *)_rnlm_smem + G::W_END + o) =
+                _pz_u32x4{0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu, 0xDEADBEEFu};
+        }
+#endif
+#ifdef MPK_QKV_DMA_IN_SLAB
+        if (mpk_slab_dma) {
+          // Phase A: every slab and residual load of this row.
+          _gl_f32x4 mpk_ws[_MAX_ITERS][MOE_WS_SLOTS];
+          _gl_u32x2 mpk_rv[_MAX_ITERS];
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE) {
+#pragma unroll
+              for (int s = 0; s < MOE_WS_SLOTS; s++) {
+                mpk_ws[it][s] =
+                    *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                        ws_base + s * REDUCTION_SIZE + off);
+              }
+              mpk_rv[it] =
+                  *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                      res_base + off);
+            }
+          }
+          asm volatile("" ::: "memory");
+          qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+              weight_ptr, n_wgs_per_xcd, tile_idx);
+          asm volatile("" ::: "memory");
+          // Phase B: the loop body below, same operations in the same order.
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE) {
+              float4 ws4;
+              ws4.x = mpk_ws[it][0][0];
+              ws4.y = mpk_ws[it][0][1];
+              ws4.z = mpk_ws[it][0][2];
+              ws4.w = mpk_ws[it][0][3];
+#pragma unroll
+              for (int s = 1; s < MOE_WS_SLOTS; s++) {
+                float4 slot4;
+                slot4.x = mpk_ws[it][s][0];
+                slot4.y = mpk_ws[it][s][1];
+                slot4.z = mpk_ws[it][s][2];
+                slot4.w = mpk_ws[it][s][3];
+                ws4.x += slot4.x;
+                ws4.y += slot4.y;
+                ws4.z += slot4.z;
+                ws4.w += slot4.w;
+              }
+              uint2 res_packed;
+              res_packed.x = mpk_rv[it][0];
+              res_packed.y = mpk_rv[it][1];
+              unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+              unsigned r1 = res_packed.x & 0xFFFF0000u;
+              unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+              unsigned r3 = res_packed.y & 0xFFFF0000u;
+              float rv0, rv1, rv2, rv3;
+              __builtin_memcpy(&rv0, &r0, 4);
+              __builtin_memcpy(&rv1, &r1, 4);
+              __builtin_memcpy(&rv2, &r2, 4);
+              __builtin_memcpy(&rv3, &r3, 4);
+              float s0 = ws4.x + rv0;
+              float s1 = ws4.y + rv1;
+              float s2 = ws4.z + rv2;
+              float s3 = ws4.w + rv3;
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+              s_cache[n_cached + 0] = s0;
+              s_cache[n_cached + 1] = s1;
+              s_cache[n_cached + 2] = s2;
+              s_cache[n_cached + 3] = s3;
+              n_cached += _VEC;
+              unsigned short o0 = _gang_float_to_bf16(s0);
+              unsigned short o1 = _gang_float_to_bf16(s1);
+              unsigned short o2 = _gang_float_to_bf16(s2);
+              unsigned short o3 = _gang_float_to_bf16(s3);
+              uint2 out_packed;
+              out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+              out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+              __builtin_memcpy(xout_base + off, &out_packed, 8);
+            }
+          }
+        } else {
+#endif
+#ifdef MPK_FOLD_PIPE
+#if defined(MPK_WS_SYS_LOAD) || defined(MPK_WS_FARCOPY) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_QKV_SLAB_HOIST) || defined(MPK_QKV_SLAB_LDS) || defined(MPK_QKV_DMA_IN_SLAB)
+#error "MPK_FOLD_PIPE replaces the plain fold loop only"
+#endif
+        // All loads first, then the unchanged arithmetic in the same order.
+        // The plain loop's x_out store may alias its sources as far as the
+        // compiler knows, so it never hoisted the next iteration's loads.
+        _gl_f32x4 fp_ws[_MAX_ITERS][MOE_WS_SLOTS];
+        _gl_u32x2 fp_rv[_MAX_ITERS];
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off_raw = tid * VEC + it * BLOCK_VEC;
+          int const off =
+              off_raw < REDUCTION_SIZE ? off_raw : REDUCTION_SIZE - VEC;
+#pragma unroll
+          for (int s = 0; s < MOE_WS_SLOTS; s++) {
+            fp_ws[it][s] =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
+          }
+          fp_rv[it] = *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+              res_base + off);
+        }
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; it++) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+            float4 ws4;
+            ws4.x = fp_ws[it][0][0];
+            ws4.y = fp_ws[it][0][1];
+            ws4.z = fp_ws[it][0][2];
+            ws4.w = fp_ws[it][0][3];
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+              ws4.x += fp_ws[it][s][0];
+              ws4.y += fp_ws[it][s][1];
+              ws4.z += fp_ws[it][s][2];
+              ws4.w += fp_ws[it][s][3];
+            }
+            unsigned r0 = (fp_rv[it][0] & 0xFFFFu) << 16;
+            unsigned r1 = fp_rv[it][0] & 0xFFFF0000u;
+            unsigned r2 = (fp_rv[it][1] & 0xFFFFu) << 16;
+            unsigned r3 = fp_rv[it][1] & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
+          }
+        }
+#elif defined(MPK_QKV_SLAB_HOIST)
+#if defined(MPK_QKV_DMA_IN_SLAB) || defined(MPK_ABLATE_WS_FOLD)
+#error "MPK_QKV_SLAB_HOIST replaces the plain slab loop"
+#endif
+        _gl_f32x4 hs_ws[_MAX_ITERS][MOE_WS_SLOTS];
+        _gl_u32x2 hs_rv[_MAX_ITERS];
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; ++it) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+#pragma unroll
+            for (int s = 0; s < MOE_WS_SLOTS; s++) {
+              hs_ws[it][s] =
+                  *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                      ws_base + s * REDUCTION_SIZE + off);
+            }
+            hs_rv[it] = *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                res_base + off);
+          }
+        }
+#pragma unroll
+        for (int it = 0; it < _MAX_ITERS; ++it) {
+          int const off = tid * VEC + it * BLOCK_VEC;
+          if (off < REDUCTION_SIZE) {
+            float4 ws4;
+            ws4.x = hs_ws[it][0][0];
+            ws4.y = hs_ws[it][0][1];
+            ws4.z = hs_ws[it][0][2];
+            ws4.w = hs_ws[it][0][3];
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+              ws4.x += hs_ws[it][s][0];
+              ws4.y += hs_ws[it][s][1];
+              ws4.z += hs_ws[it][s][2];
+              ws4.w += hs_ws[it][s][3];
+            }
+            uint2 res_packed;
+            res_packed.x = hs_rv[it][0];
+            res_packed.y = hs_rv[it][1];
+            unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+            unsigned r1 = res_packed.x & 0xFFFF0000u;
+            unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+            unsigned r3 = res_packed.y & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            __builtin_memcpy(xout_base + off, &out_packed, 8);
+          }
+        }
+#elif defined(MPK_QKV_SLAB_LDS)
+#if defined(MPK_QKV_DMA_IN_SLAB) || defined(MPK_ABLATE_WS_FOLD) || \
+    defined(MPK_KV_SPREAD)
+#error "MPK_QKV_SLAB_LDS replaces the plain slab loop and stages above G::W_END"
+#endif
+        // Every thread reads back only the LDS its own lane DMA'd (16 B of
+        // each workspace vector, 4 B of each residual half), so the wave's
+        // own vmcnt(0) below is the only ordering needed.
+        // Diagnostics: MPK_QKV_SLAB_LDS_SHADOW issues the DMAs but folds from
+        // ordinary loads; MPK_QKV_SLAB_LDS_AUX sets the DMAs' cache policy
+        // (17 = sc0 sc1).
+#ifndef MPK_QKV_SLAB_LDS_AUX
+#define MPK_QKV_SLAB_LDS_AUX 0
+#endif
+        {
+          static_assert(_MAX_ITERS == 3 && 2 * BLOCK_VEC <= REDUCTION_SIZE,
+                        "MPK_QKV_SLAB_LDS is laid out for three iterations");
+#ifdef MPK_QKV_W_TOP
+          constexpr int SL_WS = G::X_OFF;
+          constexpr int SL_RES = SL_WS + 2 * MOE_WS_SLOTS * 4096;
+          static_assert(SL_RES + 4096 <= G::X_END,
+                        "MPK_QKV_W_TOP: slab staging must fit below the QKV weights");
+#else
+#if defined(MPK_QKV_GAMMA_LDS) && !defined(MPK_QKV_GAMMA_NORMREG)
+          constexpr int SL_WS = G::W_END + 8192;
+#else
+          constexpr int SL_WS = G::W_END;
+#endif
+          constexpr int SL_RES = SL_WS + 2 * MOE_WS_SLOTS * 4096;
+          static_assert(SL_RES + 4096 <=
+                            mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE -
+                                mirage::runtime::LAYER_IDX_SMEM_OFFSET_FROM_END,
+                        "MPK_QKV_SLAB_LDS: staging must fit above the QKV weights");
+#endif
+          i32x4_t const ws_rsrc = make_w_buffer_rsrc(
+              (void const *)(d_ws + moe_ws_offset(b, 0, REDUCTION_SIZE)),
+              MOE_WS_SLOTS * REDUCTION_SIZE * 4);
+          i32x4_t const res_rsrc = make_w_buffer_rsrc(
+              (void const *)(d_residual + b * REDUCTION_SIZE),
+              REDUCTION_SIZE * 2);
+#ifdef MPK_LDS_DST_S
+          int sl_w;
+          asm volatile("s_nop 1\n\tv_readfirstlane_b32 %0, %1\n\ts_nop 4" : "=s"(sl_w) : "v"(tid >> 6));
+#else
+          int const sl_w = tid >> 6;
+#endif
+          uint8_t *const sl_wave = (uint8_t *)_rnlm_smem + sl_w * 1024;
+#ifndef MPK_QKV_SLAB_LDS_NODMA
+#pragma unroll
+          for (int it = 1; it < 3; ++it) {
+#pragma unroll
+            for (int s = 0; s < MOE_WS_SLOTS; s++) {
+              __llvm_amdgcn_raw_buffer_load_lds(
+                  ws_rsrc,
+                  (__attribute__((address_space(3))) uint32_t *)(
+                      sl_wave + SL_WS + ((it - 1) * MOE_WS_SLOTS + s) * 4096),
+                  16, tid * 16, (s * REDUCTION_SIZE + it * BLOCK_VEC) * 4, 0,
+                  MPK_QKV_SLAB_LDS_AUX);
+            }
+          }
+          uint8_t *const sl_wave4 = (uint8_t *)_rnlm_smem + sl_w * 256;
+#pragma unroll
+          for (int h = 0; h < 4; ++h) {
+            __llvm_amdgcn_raw_buffer_load_lds(
+                res_rsrc,
+                (__attribute__((address_space(3))) uint32_t *)(
+                    sl_wave4 + SL_RES + h * 1024),
+                4, tid * 8, ((h >> 1) + 1) * BLOCK_VEC * 2 + (h & 1) * 4, 0,
+                MPK_QKV_SLAB_LDS_AUX);
+          }
+#endif
+          uint8_t const *const sl_ws =
+              (uint8_t const *)_rnlm_smem + SL_WS + tid * 16;
+          uint8_t const *const sl_res =
+              (uint8_t const *)_rnlm_smem + SL_RES + tid * 4;
+#ifdef MPK_QKV_WDMA_MID
+          // Iteration 0's loads first, then this tile's weight DMA: the fold's waits retire the
+          // fold data and leave the younger weight requests in flight until Phase B.
+          using WmG = QkvWeightLds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>;
+          constexpr int kWdmaN = WmG::NUM_WAVES * WmG::LPT;
+          static_assert(kWdmaN > 0 && kWdmaN <= 63, "MPK_QKV_WDMA_MID: vmcnt holds 0..63");
+          _gl_f32x4 wm_ws[MOE_WS_SLOTS];
+          _gl_u32x2 wm_rv;
+#pragma unroll
+          for (int s = 0; s < MOE_WS_SLOTS; s++) {
+            wm_ws[s] = *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                ws_base + s * REDUCTION_SIZE + tid * VEC);
+          }
+          wm_rv = *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base + tid * VEC);
+          __builtin_amdgcn_sched_barrier(0);
+          if (mpk_wdma_mid) {
+            qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+                weight_ptr, n_wgs_per_xcd, tile_idx);
+          }
+          __builtin_amdgcn_sched_barrier(0);
+#endif
+#pragma unroll
+          for (int it = 0; it < 3; ++it) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (it < 2 || off < REDUCTION_SIZE) {
+              float4 ws4;
+              uint2 res_packed;
+#if defined(MPK_QKV_SLAB_LDS_SHADOW) || defined(MPK_QKV_SLAB_LDS_NODMA)
+              bool const sl_from_lds = false;
+#else
+              bool const sl_from_lds = it > 0;
+#endif
+              if (!sl_from_lds) {
+#ifdef MPK_QKV_WDMA_MID
+                _gl_f32x4 const ws_v = wm_ws[0];
+#else
+                _gl_f32x4 const ws_v =
+                    *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                        ws_base + off);
+#endif
+                ws4.x = ws_v[0];
+                ws4.y = ws_v[1];
+                ws4.z = ws_v[2];
+                ws4.w = ws_v[3];
+#pragma unroll
+                for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_QKV_WDMA_MID
+                  _gl_f32x4 const sv = wm_ws[s];
+#else
+                  _gl_f32x4 const sv =
+                      *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                          ws_base + s * REDUCTION_SIZE + off);
+#endif
+                  float4 slot4;
+                  slot4.x = sv[0];
+                  slot4.y = sv[1];
+                  slot4.z = sv[2];
+                  slot4.w = sv[3];
+                  ws4.x += slot4.x;
+                  ws4.y += slot4.y;
+                  ws4.z += slot4.z;
+                  ws4.w += slot4.w;
+                }
+#ifdef MPK_QKV_WDMA_MID
+                _gl_u32x2 const rv_v = wm_rv;
+#else
+                _gl_u32x2 const rv_v =
+                    *(__attribute__((address_space(1))) _gl_u32x2 const *)(
+                        res_base + off);
+#endif
+                res_packed.x = rv_v[0];
+                res_packed.y = rv_v[1];
+              } else {
+                _gl_f32x4 const ws_v =
+                    *(__attribute__((address_space(3))) _gl_f32x4 const *)(
+                        sl_ws + (it - 1) * MOE_WS_SLOTS * 4096);
+                ws4.x = ws_v[0];
+                ws4.y = ws_v[1];
+                ws4.z = ws_v[2];
+                ws4.w = ws_v[3];
+#pragma unroll
+                for (int s = 1; s < MOE_WS_SLOTS; s++) {
+                  _gl_f32x4 const sv =
+                      *(__attribute__((address_space(3))) _gl_f32x4 const *)(
+                          sl_ws + ((it - 1) * MOE_WS_SLOTS + s) * 4096);
+                  float4 slot4;
+                  slot4.x = sv[0];
+                  slot4.y = sv[1];
+                  slot4.z = sv[2];
+                  slot4.w = sv[3];
+                  ws4.x += slot4.x;
+                  ws4.y += slot4.y;
+                  ws4.z += slot4.z;
+                  ws4.w += slot4.w;
+                }
+                res_packed.x =
+                    *(__attribute__((address_space(3))) unsigned const *)(
+                        sl_res + (it - 1) * 2048);
+                res_packed.y =
+                    *(__attribute__((address_space(3))) unsigned const *)(
+                        sl_res + (it - 1) * 2048 + 1024);
+              }
+              unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+              unsigned r1 = res_packed.x & 0xFFFF0000u;
+              unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+              unsigned r3 = res_packed.y & 0xFFFF0000u;
+              float rv0, rv1, rv2, rv3;
+              __builtin_memcpy(&rv0, &r0, 4);
+              __builtin_memcpy(&rv1, &r1, 4);
+              __builtin_memcpy(&rv2, &r2, 4);
+              __builtin_memcpy(&rv3, &r3, 4);
+              float s0 = ws4.x + rv0;
+              float s1 = ws4.y + rv1;
+              float s2 = ws4.z + rv2;
+              float s3 = ws4.w + rv3;
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+              asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+              s_cache[n_cached + 0] = s0;
+              s_cache[n_cached + 1] = s1;
+              s_cache[n_cached + 2] = s2;
+              s_cache[n_cached + 3] = s3;
+              n_cached += _VEC;
+              unsigned short o0 = _gang_float_to_bf16(s0);
+              unsigned short o1 = _gang_float_to_bf16(s1);
+              unsigned short o2 = _gang_float_to_bf16(s2);
+              unsigned short o3 = _gang_float_to_bf16(s3);
+              _gl_u32x2 ov;
+              ov[0] = (unsigned)o0 | ((unsigned)o1 << 16);
+              ov[1] = (unsigned)o2 | ((unsigned)o3 << 16);
+              // The staged LDS lines must have landed before iteration 1
+              // reads them; waiting here, ahead of this store, keeps the store
+              // ack out of that wait.
+#ifdef MPK_QKV_WDMA_MID
+              if (it == 0) {
+                if (mpk_wdma_mid) {
+                  asm volatile("s_waitcnt vmcnt(%0)" ::"n"(kWdmaN) : "memory");
+                } else {
+                  asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+                }
+              }
+#else
+              if (it == 0) asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+#endif
+#ifdef MPK_QKV_SLAB_LDS_FLATSTORE
+              __builtin_memcpy(xout_base + off, &ov, 8);
+#else
+              *(__attribute__((address_space(1))) _gl_u32x2 *)(xout_base +
+                                                               off) = ov;
+#endif
+            }
+          }
+#ifdef MPK_QKV_WDMA_AFTER_SLAB
+          if (mpk_wdma_late) {
+            qkv_prefetch_weights_lds<BATCH_SIZE, OUTPUT_PER_WG, REDUCTION_SIZE>(
+                weight_ptr, n_wgs_per_xcd, tile_idx);
+          }
+#endif
+        }
+#else
+#pragma unroll
+        for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+          // Sum the MoE expert contributions here, in fixed slot order, rather
+          // than letting the W2 epilogue atomicAdd them into one slab. The
+          // order is a compile-time constant, so this row's result does not
+          // depend on the order experts happened to retire, nor on what else
+          // is in the batch. That is what makes identical prompts in different
+          // slots produce identical output. See moe_ws_layout.cuh.
+          // Typed AS(1) vector loads rather than __builtin_memcpy: the builtin
+          // is declared __host__ and rejects an address-space qualified
+          // pointer, and dereferencing the AS(1) type is what makes the
+          // backend pick global_load_dwordx4 over flat_load_dwordx4.
+#ifdef MPK_WS_SYS_LOAD
+          _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
+          _gl_f32x4 const ws_v =
+              *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                  ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off);
+#endif
+          float4 ws4;
+          ws4.x = ws_v[0];
+          ws4.y = ws_v[1];
+          ws4.z = ws_v[2];
+          ws4.w = ws_v[3];
+          // MPK_ABLATE_WS_FOLD: timing-only. Reads slot 0 and drops the other
+          // MOE_WS_SLOTS-1 slabs, so the numerics are wrong by three quarters
+          // of the MoE output -- never read tokens from a run with this set.
+          // It exists because this fold is the largest structural cost in the
+          // QKV prologue: the alternative shape is a W2 epilogue that
+          // atomicAdds into one slab so the consumer reads one, while the
+          // row-symmetry fix here (see moe_ws_layout.cuh) moved that sum into
+          // this loop, on every QKV worker, in QKV's serial window. The layout
+          // comment asks for exactly this measurement.
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+          for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
+            _gl_f32x4 const sv =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off);
+#endif
+            float4 slot4;
+            slot4.x = sv[0];
+            slot4.y = sv[1];
+            slot4.z = sv[2];
+            slot4.w = sv[3];
+            ws4.x += slot4.x;
+            ws4.y += slot4.y;
+            ws4.z += slot4.z;
+            ws4.w += slot4.w;
+          }
+#endif
+#ifdef MPK_WS_SYS_LOAD
+          _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
+          _gl_u32x2 const rv_v =
+              *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                     off);
+#endif
+          uint2 res_packed;
+          res_packed.x = rv_v[0];
+          res_packed.y = rv_v[1];
+
+          unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+          unsigned r1 = res_packed.x & 0xFFFF0000u;
+          unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+          unsigned r3 = res_packed.y & 0xFFFF0000u;
+          float rv0, rv1, rv2, rv3;
+          __builtin_memcpy(&rv0, &r0, 4);
+          __builtin_memcpy(&rv1, &r1, 4);
+          __builtin_memcpy(&rv2, &r2, 4);
+          __builtin_memcpy(&rv3, &r3, 4);
+
+          float s0 = ws4.x + rv0;
+          float s1 = ws4.y + rv1;
+          float s2 = ws4.z + rv2;
+          float s3 = ws4.w + rv3;
+
+#ifdef MPK_QKV_PRO_FAST
+          ssq = __builtin_fmaf(s0, s0, ssq);
+          ssq = __builtin_fmaf(s1, s1, ssq);
+          ssq = __builtin_fmaf(s2, s2, ssq);
+          ssq = __builtin_fmaf(s3, s3, ssq);
+#else
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+          asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+#endif
+
+          // Cache resadd sums in registers for Pass 2 (avoid re-reading x_out)
+          s_cache[n_cached + 0] = s0;
+          s_cache[n_cached + 1] = s1;
+          s_cache[n_cached + 2] = s2;
+          s_cache[n_cached + 3] = s3;
+          n_cached += _VEC;
+
+          unsigned short o0 = _gang_float_to_bf16(s0);
+          unsigned short o1 = _gang_float_to_bf16(s1);
+          unsigned short o2 = _gang_float_to_bf16(s2);
+          unsigned short o3 = _gang_float_to_bf16(s3);
+          uint2 out_packed;
+          out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+          out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+#ifndef MPK_XOUT_SLICE_WRITER
+          MPK_XOUT_STORE(xout_base + off, out_packed);
+#endif
+        }
+#endif  // MPK_FOLD_PIPE / MPK_QKV_SLAB_HOIST / MPK_QKV_SLAB_LDS
+#ifdef MPK_QKVK_FOLD
+        MPK_QKVK_MARK(1);
+#endif
+#ifdef MPK_QKV_DMA_IN_SLAB
+        }
+#endif
+#ifdef MPK_XOUT_SLICE_WRITER
+#if defined(MPK_FOLD_PIPE) || defined(MPK_WS_FARCOPY) || \
+    defined(MPK_QKV_SLAB_HOIST) || defined(MPK_QKV_SLAB_LDS) || defined(MPK_QKV_DMA_IN_SLAB)
+#error "MPK_XOUT_SLICE_WRITER covers the plain fold loop only"
+#endif
+        // One writer per XCD, its own O-proj residual slice only.
+        if (wg_idx == 0) {
+          int const xo_lo =
+              _kvupd_get_xcd_id() * (REDUCTION_SIZE / MPK_NUM_XCDS);
+          int const xo_hi = xo_lo + REDUCTION_SIZE / MPK_NUM_XCDS;
+#pragma unroll
+          for (int it = 0; it < _MAX_ITERS; it++) {
+            int const off = tid * VEC + it * BLOCK_VEC;
+            if (off < REDUCTION_SIZE && off >= xo_lo && off < xo_hi) {
+              unsigned short o0 = _gang_float_to_bf16(s_cache[it * VEC + 0]);
+              unsigned short o1 = _gang_float_to_bf16(s_cache[it * VEC + 1]);
+              unsigned short o2 = _gang_float_to_bf16(s_cache[it * VEC + 2]);
+              unsigned short o3 = _gang_float_to_bf16(s_cache[it * VEC + 3]);
+              uint2 out_packed;
+              out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+              out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+              MPK_XOUT_STORE(xout_base + off, out_packed);
+            }
+          }
+        }
+#endif
+#ifdef MPK_WS_FARCOPY
+        // MPK_WSFC_V4: a far slot of this AID's copy was still poisoned
+        // (NaN reached ssq). Redo this thread's elements with every slot
+        // read from its producer's copy, in the same order.
+        if (__builtin_expect(ssq != ssq, 0)) {
+          ssq = fc_ssq0;
+          n_cached = fc_nc0;
+          int const fc_a = (int)(kernel::mpk_prenorm_xcc() & 0x7) >> 2;
+#define MPK_FC_ADJ(s) ((((s) >> 1) - fc_a) * MOE_WS_SLOTS * REDUCTION_SIZE)
+#pragma unroll
+          for (int off = tid * VEC; off < REDUCTION_SIZE; off += BLOCK_VEC) {
+#ifdef MPK_WS_SYS_LOAD
+            _gl_f32x4 const ws_v = mpk_ws_sys_ld(ws_rs, off);
+#else
+            _gl_f32x4 const ws_v =
+                *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                    ws_base + MPK_WSLP_SLOT(0) * REDUCTION_SIZE + off + MPK_FC_ADJ(0));
+#endif
+            float4 ws4;
+            ws4.x = ws_v[0];
+            ws4.y = ws_v[1];
+            ws4.z = ws_v[2];
+            ws4.w = ws_v[3];
+#ifndef MPK_ABLATE_WS_FOLD
+#pragma unroll
+            for (int s = 1; s < MOE_WS_SLOTS; s++) {
+#ifdef MPK_WS_SYS_LOAD
+              _gl_f32x4 const sv = mpk_ws_sys_ld(ws_rs, s * REDUCTION_SIZE + off);
+#else
+              _gl_f32x4 const sv =
+                  *(__attribute__((address_space(1))) _gl_f32x4 const *)(
+                      ws_base + MPK_WSLP_SLOT(s) * REDUCTION_SIZE + off + MPK_FC_ADJ(s));
+#endif
+              float4 slot4;
+              slot4.x = sv[0];
+              slot4.y = sv[1];
+              slot4.z = sv[2];
+              slot4.w = sv[3];
+              ws4.x += slot4.x;
+              ws4.y += slot4.y;
+              ws4.z += slot4.z;
+              ws4.w += slot4.w;
+            }
+#endif
+#ifdef MPK_WS_SYS_LOAD
+            _gl_u32x2 const rv_v = mpk_res_sys_ld(res_rs, off);
+#else
+            _gl_u32x2 const rv_v =
+                *(__attribute__((address_space(1))) _gl_u32x2 const *)(res_base +
+                                                                       off);
+#endif
+            uint2 res_packed;
+            res_packed.x = rv_v[0];
+            res_packed.y = rv_v[1];
+
+            unsigned r0 = (res_packed.x & 0xFFFFu) << 16;
+            unsigned r1 = res_packed.x & 0xFFFF0000u;
+            unsigned r2 = (res_packed.y & 0xFFFFu) << 16;
+            unsigned r3 = res_packed.y & 0xFFFF0000u;
+            float rv0, rv1, rv2, rv3;
+            __builtin_memcpy(&rv0, &r0, 4);
+            __builtin_memcpy(&rv1, &r1, 4);
+            __builtin_memcpy(&rv2, &r2, 4);
+            __builtin_memcpy(&rv3, &r3, 4);
+
+            float s0 = ws4.x + rv0;
+            float s1 = ws4.y + rv1;
+            float s2 = ws4.z + rv2;
+            float s3 = ws4.w + rv3;
+
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s0));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s1));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s2));
+            asm volatile("v_fmac_f32 %0, %1, %1" : "+v"(ssq) : "v"(s3));
+
+            s_cache[n_cached + 0] = s0;
+            s_cache[n_cached + 1] = s1;
+            s_cache[n_cached + 2] = s2;
+            s_cache[n_cached + 3] = s3;
+            n_cached += _VEC;
+
+            unsigned short o0 = _gang_float_to_bf16(s0);
+            unsigned short o1 = _gang_float_to_bf16(s1);
+            unsigned short o2 = _gang_float_to_bf16(s2);
+            unsigned short o3 = _gang_float_to_bf16(s3);
+            uint2 out_packed;
+            out_packed.x = (unsigned)o0 | ((unsigned)o1 << 16);
+            out_packed.y = (unsigned)o2 | ((unsigned)o3 << 16);
+            MPK_XOUT_STORE(xout_base + off, out_packed);
+          }
+#undef MPK_FC_ADJ
+        }
+#endif
+      }
+
+      MPK_QKVSUB(1);
+#if defined(MPK_QKV_PF_PAGE_EARLY) && defined(MPK_QKV_POS_PREFETCH) && \
+    (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+#if defined(MPK_QKV_PF_PAGE_LATE) || !defined(MPK_QKV_RED_LDS_BAR)
+#error "MPK_QKV_PF_PAGE_EARLY: needs the LDS-only reduction barriers and replaces MPK_QKV_PF_PAGE_LATE"
+#endif
+      // Only the epilogue's K/V store needs the page; issued here, the reduction and the quant
+      // cover its latency instead of the GEMV barrier's fence.
+      {
+        int const num_pages = pf_kv1 - pf_kv0;
+        int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+        int const num_new_tokens = pf_qo1 - pf_qo0;
+        pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
+      }
+      pf_page = ((__attribute__((address_space(1))) int const *)
+                     kv_indices)[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
+      // ── Pass 2's norm weights, issued here rather than at their use ──────
+      //
+      // The RMSNorm weights are immutable and pass 2 cannot consume them until
+      // after the cross-wave reduction and the two __syncthreads below. Issued
+      // here, that whole tree covers the HBM latency; left at the use site
+      // (where this used to be) every iteration of pass 2 pays an exposed
+      // round trip, and this kernel sits in QKV's serial window on the
+      // critical path.
+      //
+      // `global_load_dwordx2` in asm rather than a plain dereference is
+      // load-bearing, not a micro-optimisation. norm_weight_ptr is a
+      // device-global tensor on every path, but a generic-pointer FLAT load
+      // increments lgkmcnt as well as vmcnt -- so the very first
+      // `s_waitcnt lgkmcnt(0)` in the reduction (there is one, for the LDS
+      // s_red write) would drain these too and collapse the overlap this
+      // exists to create. GLOBAL touches vmcnt only.
+#if defined(MPK_QKV_PRO_FAST) && defined(MPK_QKV_GAMMA_LDS)
+#error "MPK_QKV_PRO_FAST and MPK_QKV_GAMMA_LDS both replace the pass-2 norm prefetch"
+#endif
+#if !defined(MPK_QKV_PRO_FAST) && !defined(MPK_QKV_GAMMA_LDS)
+#pragma unroll
+      for (int iter = 0; iter < _MAX_ITERS; ++iter) {
+        int const off = tid * _VEC + iter * _BLOCK_VEC;
+        if (off < REDUCTION_SIZE) {
+          uint64_t value;
+          asm volatile("global_load_dwordx2 %0, %1, off"
+                       : "=v"(value)
+                       : "v"(d_norm_w + off)
+                       : "memory");
+          prefetched_norm_weights[iter] = value;
+        }
+      }
+#endif
+
+      #ifdef MPK_RMSNORM_DPP_REDUCE
+      // Same 32/16/8/4/2/1 tree, no LDS. Valid in lane 0 only, which is
+      // all the cross-wave publish below reads -- see the contract note at
+      // rmsnorm_wave_sum_to_lane_zero.
+      rmsnorm_wave_sum_to_lane_zero(ssq);
+      #else
+#pragma unroll
+      for (int offset = 32; offset > 0; offset >>= 1) {
+        ssq += __shfl_xor(ssq, offset);
+      }
+      #endif
+
+      float *s_red = (float *)_rnlm_smem;
+      int _wave_id = tid >> 6;
+      int _lane_id = tid & 63;
+#ifdef MPK_QKV_RED_LDS_BAR
+#if !defined(MPK_QKV_SLAB_LDS) || !defined(MPK_QKV_GAMMA_LDS) || \
+    !defined(MPK_QKV_LDS_NORM)
+#error "MPK_QKV_RED_LDS_BAR needs MPK_QKV_SLAB_LDS, MPK_QKV_GAMMA_LDS and MPK_QKV_LDS_NORM"
+#endif
+      constexpr int _num_waves = 4;
+      static_assert(_BLOCK_VEC == 256 * _VEC, "256-thread worker block");
+#else
+      int _num_waves = blockDim.x >> 6;
+#endif
+      if (_lane_id == 0) {
+        s_red[_wave_id] = ssq;
+      }
+#ifdef MPK_QKV_RED_LDS_BAR
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+      __builtin_amdgcn_s_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+      __syncthreads();
+#endif
+
+      float rms_rcp;
+#ifdef MPK_QKV_RED_FAST
+      {
+        static_assert(BATCH_SIZE == 1 && TOK_ROWS == 1,
+                      "MPK_QKV_RED_FAST: one row (the next row would reuse s_red)");
+        // wave 0's sum below, (s0 + s2) + (s1 + s3), from one broadcast read in every wave
+        float4 const r4 = *(float4 const *)s_red;
+        float const t = (r4.x + r4.z) + (r4.y + r4.w);
+        rms_rcp = rsqrtf(t / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+      }
+#else
+      if (_wave_id == 0) {
+        ssq = (_lane_id < _num_waves) ? s_red[_lane_id] : 0.0f;
+#ifdef MPK_QKV_PRO_FAST
+        static_assert(256 / 64 == 4, "4 waves: xor 2 then xor 1");
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0x4E, 0xF, 0xF, false));  // lane ^ 2
+        ssq += __int_as_float(__builtin_amdgcn_mov_dpp(
+            __float_as_int(ssq), 0xB1, 0xF, 0xF, false));  // lane ^ 1
+#else
+        for (int offset = _num_waves >> 1; offset > 0; offset >>= 1) {
+          ssq += __shfl_xor(ssq, offset);
+        }
+#endif
+        if (_lane_id == 0) {
+          s_red[0] = rsqrtf(ssq / (float)ACTUAL_HIDDEN_DIM + 1e-5f);
+        }
+      }
+#ifdef MPK_QKV_RED_LDS_BAR
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+      __builtin_amdgcn_s_barrier();
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+      __syncthreads();
+#endif
+      rms_rcp = s_red[0];
+#endif  // MPK_QKV_RED_FAST
+#ifdef MPK_QKVK_FOLD
+      MPK_QKVK_MARK(2);
+#endif
+
+      // Pass 2: Apply norm weight using CACHED sums (no re-read of x_out)
+#ifdef MPK_QKV_LDS_NORM
+      // Rows this column block will not quantize have nothing left to
+      // contribute -- pass 1 already wrote their x_output -- so their pass 2
+      // is dead work here, where the global path merely made it invisible by
+      // having every block write the same bytes.
+      int const _lds_norm_row = b - tok_row_base;
+      if (_lds_norm_row < 0 || _lds_norm_row >= TOK_ROWS) {
+        continue;
+      }
+#endif
+      {
+        using bf16 = __hip_bfloat16;
+        constexpr int VEC = 4;
+#ifdef MPK_QKV_LDS_NORM
+        bf16 *out = (bf16 *)s_norm_out + _lds_norm_row * REDUCTION_SIZE;
+#else
+        bf16 *out = (bf16 *)d_norm_out + b * REDUCTION_SIZE;
+#endif
+#ifdef MPK_QKV_NQ_FUSED2
+        {
+          static_assert(TOK_ROWS == 1 && VEC == 4 && _BLOCK_VEC == 1024 &&
+                            REDUCTION_SIZE > 2 * 1024 && REDUCTION_SIZE <= 3 * 1024 &&
+                            (REDUCTION_SIZE - 2 * 1024) % 128 == 0,
+                        "MPK_QKV_NQ_FUSED2: one row, three passes, whole super-blocks");
+#if !defined(MPK_QKV_GAMMA_LDS) || !defined(MPK_QKV_GAMMA_NORMREG)
+#error "MPK_QKV_NQ_FUSED2 reads gamma from s_norm_out (MPK_QKV_GAMMA_LDS + MPK_QKV_GAMMA_NORMREG)"
+#endif
+          bool const nq_ok2 = tid * VEC + 2 * _BLOCK_VEC < REDUCTION_SIZE;
+          float nq_v[3][VEC];
+          float nq_am[3];
+#pragma unroll
+          for (int it = 0; it < 3; it++) {
+            bool const ok = it < 2 || nq_ok2;
+            uint64_t wv;
+            __builtin_memcpy(&wv, &out[tid * VEC + (ok ? it : 0) * _BLOCK_VEC], 8);
+            bf16 const *wa = (bf16 const *)&wv;
+            nq_am[it] = 0.0f;
+#pragma unroll
+            for (int j = 0; j < VEC; j++) {
+              bf16 const o = __float2bfloat16(s_cache[it * VEC + j] * rms_rcp *
+                                              __bfloat162float(wa[j]));
+              nq_v[it][j] = ok ? __bfloat162float(o) : 0.0f;
+              nq_am[it] = fmaxf(nq_am[it], fabsf(nq_v[it][j]));
+            }
+          }
+          {
+            // max over each 32-lane group (one 128-element super-block): xor 1, xor 2,
+            // row_ror 4, row_ror 8, then lane ^ 16 via permlane16_swap on a copy.
+            float p0, p1, p2;
+            asm volatile(
+                "s_nop 1\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] row_ror:4 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a0], %[a0], %[a0] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a1], %[a1], %[a1] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_max_f32_dpp %[a2], %[a2], %[a2] row_ror:8 row_mask:0xf bank_mask:0xf\n"
+                "v_mov_b32_e32 %[p0], %[a0]\n"
+                "v_mov_b32_e32 %[p1], %[a1]\n"
+                "v_mov_b32_e32 %[p2], %[a2]\n"
+                "s_nop 1\n"
+                "v_permlane16_swap_b32 %[a0], %[p0]\n"
+                "v_permlane16_swap_b32 %[a1], %[p1]\n"
+                "v_permlane16_swap_b32 %[a2], %[p2]\n"
+                "s_nop 1\n"
+                "v_max_f32_e32 %[a0], %[a0], %[p0]\n"
+                "v_max_f32_e32 %[a1], %[a1], %[p1]\n"
+                "v_max_f32_e32 %[a2], %[a2], %[p2]"
+                : [a0] "+v"(nq_am[0]), [a1] "+v"(nq_am[1]), [a2] "+v"(nq_am[2]),
+                  [p0] "=&v"(p0), [p1] "=&v"(p1), [p2] "=&v"(p2));
+          }
+#pragma unroll
+          for (int it = 0; it < 3; it++) {
+            uint8_t const se = _gang_compute_e8m0_fp8(nq_am[it]);
+            float scale = 1.0f;
+            if (se != 0) {
+              union {
+                float f;
+                uint32_t u;
+              } sv;
+              sv.u = (uint32_t)se << 23;
+              scale = sv.f;
+            }
+            fp8x4_t pk = {};
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, nq_v[it][0], nq_v[it][1], scale, false);
+            pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(pk, nq_v[it][2], nq_v[it][3], scale, true);
+            if (it < 2 || nq_ok2) {
+              int const off = tid * VEC + it * _BLOCK_VEC;
+              *(int *)(s_tok_fp8 + off) = *(int const *)&pk;
+              if ((tid & 31) == 0) {
+                s_tok_scales[off >> 7] = se;
+              }
+            }
+          }
+        }
+#else
+        int ci = 0;
+        int wi = 0;
+#pragma unroll
+        for (int off = tid * VEC; off < REDUCTION_SIZE; off += _BLOCK_VEC) {
+          // The inline-asm load that produced this is opaque to the compiler,
+          // so nothing here makes it insert a vmcnt wait. What does is the
+          // second __syncthreads between the issue site and this use: its
+          // fence emits `s_waitcnt vmcnt(0)` ahead of the barrier. That is a
+          // property of the generated code rather than of the source, so it is
+          // verified in the disassembly -- look for a vmcnt(0) between the
+          // global_load_dwordx2 block and this loop before trusting a number
+          // from this path.
+#ifdef MPK_QKV_GAMMA_LDS
+          // DMA'd before the slab pass; the two barriers since drained it.
+          uint64_t wv;
+#ifdef MPK_QKV_GAMMA_NORMREG
+          __builtin_memcpy(&wv, &out[off], 8);
+#else
+          __builtin_memcpy(&wv, (uint8_t *)_rnlm_smem + G::W_END + off * 2, 8);
+#endif
+          (void)wi;
+#else
+          uint64_t wv = prefetched_norm_weights[wi++];
+#endif
+          bf16 const *wa = (bf16 const *)&wv;
+          bf16 ov[VEC];
+#pragma unroll
+          for (int j = 0; j < VEC; j++) {
+            ov[j] = __float2bfloat16(s_cache[ci + j] * rms_rcp *
+                                     __bfloat162float(wa[j]));
+          }
+#ifdef MPK_QKV_NQ_FUSED
+          {
+            // _gang_multirow_fp8_quant's arithmetic on this thread's 4 values; a 128-element
+            // super-block (one scale byte) is 32 consecutive lanes.
+            static_assert(TOK_ROWS == 1 && VEC == 4 && _BLOCK_VEC == 1024 &&
+                              REDUCTION_SIZE % 128 == 0,
+                          "MPK_QKV_NQ_FUSED: one row, 4 values per thread, whole super-blocks");
+            float qv[VEC];
+            float am = 0.0f;
+#pragma unroll
+            for (int j = 0; j < VEC; j++) {
+              qv[j] = __bfloat162float(ov[j]);
+              am = fmaxf(am, fabsf(qv[j]));
+            }
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0xB1, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x4E, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x124, 0xF, 0xF, false)));
+            am = fmaxf(am, __int_as_float(__builtin_amdgcn_update_dpp(
+                               __float_as_int(am), __float_as_int(am), 0x128, 0xF, 0xF, false)));
+            am = fmaxf(am, __shfl_xor(am, 16));
+            uint8_t const nq_se = _gang_compute_e8m0_fp8(am);
+            float nq_scale = 1.0f;
+            if (nq_se != 0) {
+              union {
+                float f;
+                uint32_t u;
+              } nq_sv;
+              nq_sv.u = (uint32_t)nq_se << 23;
+              nq_scale = nq_sv.f;
+            }
+            fp8x4_t nq_pk = {};
+            nq_pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(nq_pk, qv[0], qv[1], nq_scale, false);
+            nq_pk = __builtin_amdgcn_cvt_scalef32_pk_fp8_f32(nq_pk, qv[2], qv[3], nq_scale, true);
+            *(int *)(s_tok_fp8 + off) = *(int const *)&nq_pk;
+            if ((tid & 31) == 0) {
+              s_tok_scales[off >> 7] = nq_se;
+            }
+          }
+#else
+          __builtin_memcpy(&out[off], ov, 8);
+#endif
+          ci += VEC;
+        }
+#endif  // MPK_QKV_NQ_FUSED2
+      }
+    }
+  }
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT) && \
+    !defined(MPK_QKV_PF_PAGE_EARLY)
+  // compute_pos(0) for the only request (request_id stays 0), with the
+  // page lookup issued now so it retires behind RMSNorm and the quant.
+  {
+    int const num_pages = pf_kv1 - pf_kv0;
+    int const global_seq_len = (num_pages - 1) * PAGE_SIZE + pf_lpl;
+    int const num_new_tokens = pf_qo1 - pf_qo0;
+    pf_gp = global_seq_len - num_new_tokens + (MPK_QKV_TOK_OFF tok_row_base - pf_qo0);
+  }
+#ifndef MPK_QKV_PF_PAGE_LATE
+  pf_page = kv_indices[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
+#ifdef MPK_VTN_QPAIR
+  // MPK_VTN_QPAIR v2: fold + take, the second token's position.
+#if defined(MPK_QKV_PF_PAGE_LATE) || defined(MPK_QKV_PF_PAGE_EARLY)
+#error "MPK_VTN_QPAIR v2 is wired for the default page lookup"
+#endif
+  if (qpair) {
+    int const num_pages2 = pf2_kv1 - pf2_kv0;
+    int const global_seq_len2 = (num_pages2 - 1) * PAGE_SIZE + pf2_lpl;
+    int const num_new_tokens2 = pf2_qo1 - pf2_qo0;
+    pf2_gp = global_seq_len2 - num_new_tokens2 + (tok_off2 + tok_row_base - pf2_qo0);
+    pf2_page = kv_indices[pf2_kv0 + pf2_gp / PAGE_SIZE];
+  }
+#ifdef MPK_VTN_QTRI
+  if (qtri) {
+    int const num_pages3 = pf3_kv1 - pf3_kv0;
+    int const global_seq_len3 = (num_pages3 - 1) * PAGE_SIZE + pf3_lpl;
+    int const num_new_tokens3 = pf3_qo1 - pf3_qo0;
+    pf3_gp = global_seq_len3 - num_new_tokens3 + (tok_off3 + tok_row_base - pf3_qo0);
+    pf3_page = kv_indices[pf3_kv0 + pf3_gp / PAGE_SIZE];
+  }
+#endif
+#endif
+#endif
+#ifndef MPK_QKV_NQ_FUSED2
+#ifdef MPK_QKV_RED_LDS_BAR
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup");
+  __syncthreads();
+#endif
+#endif
+#if defined(MPK_QKV_PF_PAGE_LATE) && defined(MPK_QKV_POS_PREFETCH) && \
+    (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+  // GLOBAL, and after the barrier: as a FLAT load before it, the barrier's
+  // lgkmcnt(0) drained it. Here it retires behind the quant.
+  pf_page = ((__attribute__((address_space(1))) int const *)
+                 kv_indices)[pf_kv0 + pf_gp / PAGE_SIZE];
+#endif
+
+  MPK_QKVSUB(2);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t1 = __builtin_amdgcn_s_memrealtime();
+    _sp_t2 = _sp_t1;
+  }
+#endif
+#ifdef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(3);
+  MPK_QKVK_MARK(4);
+#else
+  MPK_QKVK_MARK(1);
+#endif
+
+  // ── Step 2: Prepare activation in LDS ──────────────────────────────────
+
+#ifdef MPK_QKV_LDS_NORM
+  // s_norm_out already holds only this block's rows, so the row base is 0 and
+  // the clamp bound is TOK_ROWS rather than BATCH_SIZE. The quantizer reads
+  // through a generic pointer, which resolves to the LDS aperture here.
+#if !defined(MPK_QKV_NQ_FUSED) && !defined(MPK_QKV_NQ_FUSED2)
+  _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, TOK_ROWS, TOK_ROW_STRIDE,
+                           SC_STRIDE>(s_norm_out,
+                                      REDUCTION_SIZE,
+                                      0,
+                                      batch_count - tok_row_base,
+                                      s_tok_fp8,
+                                      s_tok_scales);
+#endif  // quantized in the normalize loop; the barrier below publishes s_tok_fp8
+#else
+  _gang_multirow_fp8_quant<REDUCTION_SIZE, TOK_ROWS, BATCH_SIZE, TOK_ROW_STRIDE,
+                           SC_STRIDE>(
+      (unsigned short const *)norm_scratch_ptr, REDUCTION_SIZE, tok_row_base,
+      batch_count - tok_row_base, s_tok_fp8, s_tok_scales);
+#endif
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+    {
+      int const tok_slot =
+          _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+      uint8_t *tok_dst =
+          &g_qkv_kpart_tok[tok_slot * MPK_QKV_KSPLIT_TOK_BYTES];
+      constexpr int nbytes = TOK_REGION + SC_REGION;
+#pragma unroll 1
+      for (int off = tid * 8; off < nbytes; off += 256 * 8) {
+        unsigned long long v;
+        __builtin_memcpy(&v, s_tok_fp8 + off, 8);
+        st_wt_u64(tok_dst + off, v);
+      }
+      asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+      __syncthreads();
+      if (tid == 0) {
+        st_wt_u32(&g_qkv_kpart_tok_ready[tok_slot], 1u);
+      }
+    }
+  }
+#endif
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+    if (MPK_QROW_GIVE) {
+      // Publish the row: stores now, flag after Phase B's barrier, whose
+      // vmcnt(0) on every wave has drained them.
+      __syncthreads();
+#ifdef MPK_VTN_QROW_TAG
+      {
+        constexpr int kvr_nw = (TOK_REGION + SC_REGION) / 4;
+        int const qx = _kvupd_get_xcd_id();
+#ifdef MPK_VTN_QMP
+        int *const qt = g_aid_nc_rep[qx >> 2] + MPK_NC_QROW_INTS +
+                        (((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off) *
+                            MPK_NC_QROW_SLOT_INTS;
+#else
+        int *const qt = g_aid_flag_rep[qx >> 2] + MPK_AID_QROW_BASE_INTS +
+                        ((qx & 3) * 2 + (kv_row_epoch & 1)) * MPK_AID_QROW_SLOT_INTS;
+#endif
+        unsigned long long const qtag = (unsigned long long)(unsigned)kv_row_epoch << 32;
+#pragma unroll
+        for (int i = tid; i < kvr_nw; i += 256) {
+          st_wt_u64(qt + 2 * i, qtag | ((uint32_t const *)s_tok_fp8)[i]);
+        }
+      }
+#else
+      uint8_t *kvr_dst = &g_qkv_kv_row[kvr_slot * MPK_QKV_KV_ROW_BYTES];
+      constexpr int kvr_nbytes = TOK_REGION + SC_REGION;
+#pragma unroll
+      for (int off = tid * 8; off < kvr_nbytes; off += 256 * 8) {
+        unsigned long long v;
+        __builtin_memcpy(&v, s_tok_fp8 + off, 8);
+        st_wt_u64(kvr_dst + off, v);
+      }
+#endif
+    }
+#ifdef MPK_VTN_QPAIR
+    // MPK_VTN_QPAIR v2 (fold + take): the second token's row into the norm block, which the quant above
+    // has finished reading once every wave reaches the barrier.
+    if (qpair) {
+      constexpr int kvr_nw2 = (TOK_REGION + SC_REGION) / 4;
+      int const qx2 = _kvupd_get_xcd_id();
+      int const *const qtb = g_aid_nc_rep[qx2 >> 2] + MPK_NC_QROW_INTS +
+                             (((qx2 & 3) * 2 + (kv_row_epoch & 1)) * MPK_VTN_T + tok_off2) *
+                                 MPK_NC_QROW_SLOT_INTS;
+      bool const qb1 = tid + 256 < kvr_nw2, qb2 = tid + 512 < kvr_nw2;
+      unsigned const qbtag = (unsigned)kv_row_epoch;
+      unsigned long long qy0 = 0ull, qy1 = 0ull, qy2 = 0ull;
+#ifdef MPK_VTN_QTRI
+      unsigned long long qz0 = 0ull, qz1 = 0ull, qz2 = 0ull;
+      if (qtri) {
+        int const *const qtc = qtb + (tok_off3 - tok_off2) * MPK_NC_QROW_SLOT_INTS;
+        while (true) {
+          asm volatile("global_load_dwordx2 %0, %6, off sc0 sc1\n"
+                       "global_load_dwordx2 %1, %7, off sc0 sc1\n"
+                       "global_load_dwordx2 %2, %8, off sc0 sc1\n"
+                       "global_load_dwordx2 %3, %9, off sc0 sc1\n"
+                       "global_load_dwordx2 %4, %10, off sc0 sc1\n"
+                       "global_load_dwordx2 %5, %11, off sc0 sc1\n"
+                       "s_waitcnt vmcnt(0)"
+                       : "=&v"(qy0), "=&v"(qy1), "=&v"(qy2), "=&v"(qz0), "=&v"(qz1), "=&v"(qz2)
+                       : "v"(qtb + 2 * tid), "v"(qtb + 2 * (tid + 256)), "v"(qtb + 2 * (tid + 512)),
+                         "v"(qtc + 2 * tid), "v"(qtc + 2 * (tid + 256)), "v"(qtc + 2 * (tid + 512))
+                       : "memory");
+          if ((unsigned)(qy0 >> 32) == qbtag && (!qb1 || (unsigned)(qy1 >> 32) == qbtag) &&
+              (!qb2 || (unsigned)(qy2 >> 32) == qbtag) && (unsigned)(qz0 >> 32) == qbtag &&
+              (!qb1 || (unsigned)(qz1 >> 32) == qbtag) && (!qb2 || (unsigned)(qz2 >> 32) == qbtag)) {
+            break;
+          }
+          __builtin_amdgcn_s_sleep(1);
+        }
+      } else
+#endif
+      while (true) {
+        asm volatile("global_load_dwordx2 %0, %3, off sc0 sc1\n"
+                     "global_load_dwordx2 %1, %4, off sc0 sc1\n"
+                     "global_load_dwordx2 %2, %5, off sc0 sc1\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=&v"(qy0), "=&v"(qy1), "=&v"(qy2)
+                     : "v"(qtb + 2 * tid), "v"(qtb + 2 * (tid + 256)), "v"(qtb + 2 * (tid + 512))
+                     : "memory");
+        if ((unsigned)(qy0 >> 32) == qbtag && (!qb1 || (unsigned)(qy1 >> 32) == qbtag) &&
+            (!qb2 || (unsigned)(qy2 >> 32) == qbtag)) {
+          break;
+        }
+        __builtin_amdgcn_s_sleep(1);
+      }
+      __syncthreads();
+      ((uint32_t *)s_tok2)[tid] = (uint32_t)qy0;
+      if (qb1) ((uint32_t *)s_tok2)[tid + 256] = (uint32_t)qy1;
+      if (qb2) ((uint32_t *)s_tok2)[tid + 512] = (uint32_t)qy2;
+#ifdef MPK_VTN_QTRI
+      if (qtri) {
+        ((uint32_t *)s_tok3)[tid] = (uint32_t)qz0;
+        if (qb1) ((uint32_t *)s_tok3)[tid + 256] = (uint32_t)qz1;
+        if (qb2) ((uint32_t *)s_tok3)[tid + 512] = (uint32_t)qz2;
+      }
+#endif
+    }
+#endif
+  }
+#endif
+
+  // ── Phase B: Drain buffer_load_lds, scatter scales to LDS ──
+  {
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+
+#ifndef MPK_QKV_PREFETCH_SCALES
+    constexpr int QKV_SC_DW4_PER_TILE = QKV_TILE_SCALE / 16;
+    constexpr int QKV_TOTAL_SC_DW4 = (QKV_TILE_SCALE * NUM_WAVES) / 16;
+    constexpr int QKV_SC_LPT = (QKV_TOTAL_SC_DW4 + 255) / 256;
+    i32x4_t qkv_sc_buf[QKV_SC_LPT];
+    {
+      i32x4_t const *sc_src = (i32x4_t const *)wg_scales;
+#pragma unroll
+      for (int j = 0; j < QKV_SC_LPT; j++) {
+        int idx = tid + j * 256;
+        if (idx < QKV_TOTAL_SC_DW4) {
+          qkv_sc_buf[j] = sc_src[idx];
+        }
+      }
+    }
+
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+    {
+#pragma unroll
+      for (int j = 0; j < QKV_SC_LPT; j++) {
+        int idx = tid + j * 256;
+        if (idx < QKV_TOTAL_SC_DW4) {
+          int tile = idx / QKV_SC_DW4_PER_TILE;
+          int off = idx % QKV_SC_DW4_PER_TILE;
+          i32x4_t *dst_sc = (i32x4_t *)(qkv_lds_w + tile * QKV_TILE_BYTES +
+                                        QKV_TILE_DATA_PADDED);
+          dst_sc[off] = qkv_sc_buf[j];
+        }
+      }
+    }
+#endif // MPK_QKV_PREFETCH_SCALES
+
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+    __syncthreads();
+  }
+#if defined(MPK_QKV_KV_SHARED_ROW) || defined(MPK_VTN_QROW)
+  if (MPK_QROW_GIVE && tid == 0) {
+    st_wt_u32(&g_qkv_kv_row_epoch[kvr_slot * 16], (unsigned)kv_row_epoch);
+  }
+#endif
+
+  // Whole-block early-out only: a column block with no real tokens at all.
+  // Individual inactive lanes within a live block must NOT return here -- they
+  // still have to issue their ds_reads and their share of the MFMA, and they
+  // participate in the __syncthreads inside the RoPE epilogue.
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(2);
+#endif
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int const n_valid_tok = batch_count - tok_row_base + (qpair ? 1 : 0) + (qtri ? 1 : 0);
+#else
+  int const n_valid_tok = batch_count - tok_row_base + (qpair ? 1 : 0);
+#endif
+#else
+  int const n_valid_tok = batch_count - tok_row_base;
+#endif
+  if (n_valid_tok <= 0) {
+    return;
+  }
+  bool const tok_active = col < n_valid_tok;
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int const pcol = (qpair && col == 1) ? 1 : ((qtri && col == 2) ? 2 : 0);  // the token this lane's column carries
+#else
+  int const pcol = (qpair && col == 1) ? 1 : 0;  // which token this lane's MFMA column carries
+#endif
+#else
+  constexpr int pcol = 0;
+#ifndef MPK_QPAIR_DQ
+#define MPK_QPAIR_DQ 0
+#endif
+#endif
+
+  // ── Per-token position metadata ────────────────────────────────────────
+  // The single-token path derived request_id / global_pos / dst_idx from one
+  // tok_idx; every thread computed the same values in registers. With 16
+  // tokens in flight each column needs its own set, so 16 threads compute them
+  // into LDS and everyone reads them back.
+  //
+  // At TOK_ROWS == 1 that broadcast is pure overhead -- one barrier and 128 B
+  // of static LDS to publish a value every thread could recompute. So that
+  // case keeps the register form and the tables become thread-private arrays
+  // of length 1, which the consumers index identically.
+#ifdef MPK_VTN_QPAIR
+#ifdef MPK_VTN_QTRI
+  int _priv_global_pos[TOK_ROWS + 2];
+  int _priv_dst_idx[TOK_ROWS + 2];
+#else
+  int _priv_global_pos[TOK_ROWS + 1];
+  int _priv_dst_idx[TOK_ROWS + 1];
+#endif
+#else
+  int _priv_global_pos[TOK_ROWS];
+  int _priv_dst_idx[TOK_ROWS];
+#endif
+  __shared__ int s_pos_tbl[TOK_ROWS > 1 ? 2 * MFMA_N : 1];
+  int const *s_global_pos;
+  int const *s_dst_idx;
+
+  auto compute_pos = [&](int t, int &gp_out, int &dst_out) {
+    int my_tok = MPK_QKV_TOK_OFF tok_row_base + (t < n_valid_tok ? t : 0);
+    int request_id = 0;
+    while (qo_indptr[request_id + 1] <= my_tok) {
+      request_id++;
+    }
+    int token_in_request = my_tok - qo_indptr[request_id];
+    int first_page = kv_indptr[request_id];
+    int num_pages = kv_indptr[request_id + 1] - first_page;
+    int last_page_len_val = kv_last_page_len[request_id];
+    int global_seq_len = (num_pages - 1) * PAGE_SIZE + last_page_len_val;
+    int num_new_tokens = qo_indptr[request_id + 1] - qo_indptr[request_id];
+    gp_out = global_seq_len - num_new_tokens + token_in_request;
+#ifdef MPK_QKV_GLOBAL_PAGE
+    // kv_indices is always a device-global paging table. Keeping that address
+    // space through the dereference changes the final dependent page lookup
+    // from FLAT (vmcnt+lgkmcnt) to GLOBAL (vmcnt only), so QKV's LDS waits do
+    // not accidentally retire it before the MFMA can cover its latency.
+    auto const *global_kv_indices =
+        (__attribute__((address_space(1))) int const *)kv_indices;
+    int page_idx = global_kv_indices[first_page + gp_out / PAGE_SIZE];
+#else
+    int page_idx = kv_indices[first_page + gp_out / PAGE_SIZE];
+#endif
+    dst_out = page_idx * PAGE_SIZE + gp_out % PAGE_SIZE;
+  };
+
+  if constexpr (TOK_ROWS == 1) {
+#if defined(MPK_QKV_POS_PREFETCH) && (MPK_MAX_NUM_BATCHED_REQUESTS == 1 || MPK_QKV_PF_VSLOT)
+#ifdef MPK_QKV_POS_CACHE
+#error "MPK_QKV_POS_PREFETCH and MPK_QKV_POS_CACHE both replace compute_pos"
+#endif
+    _priv_global_pos[0] = pf_gp;
+    _priv_dst_idx[0] = pf_page * PAGE_SIZE + pf_gp % PAGE_SIZE;
+#ifdef MPK_VTN_QPAIR
+    _priv_global_pos[1] = qpair ? pf2_gp : pf_gp;
+    _priv_dst_idx[1] = qpair ? pf2_page * PAGE_SIZE + pf2_gp % PAGE_SIZE : _priv_dst_idx[0];
+#ifdef MPK_VTN_QTRI
+    _priv_global_pos[2] = qtri ? pf3_gp : pf_gp;
+    _priv_dst_idx[2] = qtri ? pf3_page * PAGE_SIZE + pf3_gp % PAGE_SIZE : _priv_dst_idx[0];
+#endif
+#endif
+#elif defined(MPK_QKV_POS_CACHE)
+    __shared__ int s_qkv_pos_cache[2];
+    if (pos_cache == 2) {
+      _priv_global_pos[0] = s_qkv_pos_cache[0];
+      _priv_dst_idx[0] = s_qkv_pos_cache[1];
+    } else {
+      compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+      if (pos_cache == 1 && tid == 0) {
+        s_qkv_pos_cache[0] = _priv_global_pos[0];
+        s_qkv_pos_cache[1] = _priv_dst_idx[0];
+      }
+    }
+#else
+    compute_pos(0, _priv_global_pos[0], _priv_dst_idx[0]);
+#endif
+    s_global_pos = _priv_global_pos;
+    s_dst_idx = _priv_dst_idx;
+  } else {
+    if (tid < TOK_ROWS) {
+      int gp, dst;
+      compute_pos(tid, gp, dst);
+      s_pos_tbl[tid] = gp;
+      s_pos_tbl[MFMA_N + tid] = dst;
+    }
+    __syncthreads();
+    s_global_pos = s_pos_tbl;
+    s_dst_idx = s_pos_tbl + MFMA_N;
+  }
+
+  MPK_QKVSUB(3);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t3 = __builtin_amdgcn_s_memrealtime();
+  }
+#endif
+#ifdef MPK_QKV_EPI_PF
+  // RoPE pair for lane d = tid (the epilogue's only iteration when
+  // TOK_ROWS == 1), issued before the MFMA so it lands under it.
+  unsigned short epi_cos_pf = 0, epi_sin_pf = 0;
+  if constexpr (TOK_ROWS == 1) {
+    if (tid < HEAD_DIM / 2) {
+      long long const rp = (long long)s_global_pos[0] * HEAD_DIM + tid;
+      epi_cos_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)cos_ptr)[rp];
+      epi_sin_pf =
+          ((__attribute__((address_space(1))) unsigned short const *)sin_ptr)[rp];
+    }
+  }
+#endif
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(3);
+#endif
+#ifdef MPK_QT_TS
+  qt_t[3] = (unsigned int)__builtin_amdgcn_s_memrealtime();
+#endif
+
+  // ── MFMA + KV Update epilogue ─────────────────────────────────────────
+  // ── QKV asm MFMA loop (weights already in LDS from Phase A/B) ──
+  {
+    uint8_t *lds_qkv_base = (uint8_t *)_rnlm_smem + QKV_LDS_OFF;
+
+    constexpr int ROW_DATA = REDUCTION_SIZE / 2;   // 1536
+    constexpr int ROW_SCALE = REDUCTION_SIZE / 32; // 96
+
+#ifdef MPK_QKV_MFMA_UNROLLED
+    // The .rept arm emits (MFMA_ITERS-1)/2 bank pairs and exactly one bank-0
+    // tail, which only covers MFMA_ITERS when the count is odd. At an even
+    // count the last iteration's operands land in bank 1 and the emitted tail
+    // would re-run iteration MFMA_ITERS-2 with bank 0 -- silently wrong, not a
+    // build error, so it is caught here instead. The branching arm handles
+    // both parities and stays available.
+    static_assert(MFMA_ITERS % 2 == 1,
+                  "MPK_QKV_MFMA_UNROLLED assumes an odd MFMA_ITERS "
+                  "(REDUCTION_SIZE / 128); at an even count use the default "
+                  "branching loop, which emits both tails");
+#endif
+#if defined(MPK_QKV_IMM) &&                                                    \
+    (!defined(MPK_QKV_MFMA_UNROLLED) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||       \
+     defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_B_MASK) ||                \
+     defined(MPK_QKV_TSC_PTR_INCREMENT) || defined(MPK_ABLATE_QKV_KMAJOR_ADDR) || \
+     defined(MPK_QKV_KSPLIT) || defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3))
+#error "MPK_QKV_IMM covers the unrolled PF_BEFORE_WAIT QKV body only"
+#endif
+#if defined(MPK_QKV_MFMA_UNROLLED) && defined(MPK_QKV_TSC_PTR_INCREMENT)
+#error                                                                         \
+    "MPK_QKV_TSC_PTR_INCREMENT targets the scalar-counter loop; "              \
+    "MPK_QKV_MFMA_UNROLLED replaces that loop"
+#endif
+#if defined(MPK_QKV_DS_BEFORE_ADDR) && !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_DS_BEFORE_ADDR requires MPK_QKV_PF_BEFORE_WAIT"
+#endif
+#if defined(MPK_QKV_DS_BEFORE_ADDR) &&                                          \
+    (defined(MPK_QKV_MFMA_UNROLLED) || defined(MPK_QKV_TSC_PTR_INCREMENT))
+#error "MPK_QKV_DS_BEFORE_ADDR is the default PF_BEFORE_WAIT pointer-bump path"
+#endif
+#if defined(MPK_QKV_SKIP_B1_WAIT) && !defined(MPK_QKV_PF_BEFORE_WAIT)
+#error "MPK_QKV_SKIP_B1_WAIT requires MPK_QKV_PF_BEFORE_WAIT"
+#endif
+
+#ifdef MPK_ABLATE_KV_EXTRA
+#ifndef MPK_ABLATE_KV_TILES
+#error "MPK_ABLATE_KV_EXTRA needs MPK_ABLATE_KV_TILES"
+#endif
+    int const _abl_extra = (wg_idx < NUM_Q_PER_KV) ? 1 : 0;
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE + _abl_extra;
+         tile_iter++) {
+      int wave_tile =
+          warp_id +
+          (tile_iter >= _abl_extra ? tile_iter - _abl_extra : 0) * NUM_WAVES;
+#else
+    for (int tile_iter = 0; tile_iter < TILES_PER_WAVE; tile_iter++) {
+      int wave_tile = warp_id + tile_iter * NUM_WAVES;
+#endif
+
+      uint8_t *lds_wd = lds_qkv_base + warp_id * QKV_TILE_BYTES;
+      uint8_t *lds_ws = lds_wd + QKV_TILE_DATA_PADDED;
+
+      // ── Pipelined asm MFMA loop — sequential addressing (W13 pattern) ──
+      // Weight data layout: per row = K/2 = 1536 bytes, stride +64 per iter
+      // Weight scale layout: per row = K/32 = 96 bytes, stride +4 per iter
+      // Token layout: stride +0x80 per iter (128 bytes)
+      // Token scale: stride +1 per iter (1 byte)
+      float qa0, qa1, qa2, qa3;
+#ifdef MPK_QKV_ROPE_REG
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_KV_SPREAD) ||                 \
+    defined(MPK_QKV_PF3) || defined(MPK_QKV_KSPLIT)
+#error "MPK_QKV_ROPE_REG is wired for the single-chain loop, alone"
+#endif
+      static_assert(TOK_ROWS == 1 && HEAD_DIM == 64 && OUTPUT_PER_WG == 64 &&
+                        TILES_PER_WAVE == 1,
+                    "MPK_QKV_ROPE_REG: batch 1, 64-row head tiles");
+      uint64_t epi_b4 = 0, epi_c = 0, epi_s = 0;
+      unsigned long long const epi_pb = (unsigned long long)(
+          d_bias + wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+      long long const epi_cs = (long long)s_global_pos[pcol] * HEAD_DIM +
+                               8 * wave_tile + (g & 1) * 4;
+      unsigned long long const epi_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + epi_cs);
+      unsigned long long const epi_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + epi_cs);
+#endif
+#ifdef MPK_QKV_EPI_PRELOAD
+      uint64_t epi_b4 = 0;
+      unsigned epi_c = 0, epi_s = 0;
+      unsigned long long const epi_pb = (unsigned long long)(
+          d_bias + wg_idx * OUTPUT_PER_WG + wave_tile * 16 + g * 4);
+      long long const epi_cs = (long long)s_global_pos[0] * HEAD_DIM +
+                               (lane_id & (HEAD_DIM / 2 - 1));
+      unsigned long long const epi_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + epi_cs);
+      unsigned long long const epi_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + epi_cs);
+#endif
+#ifdef MPK_QKV_B_MASK
+      unsigned long long qkv_bsv;
+#endif
+#ifdef MPK_KV_SPREAD
+      float qb0 = 0.f, qb1 = 0.f, qb2 = 0.f, qb3 = 0.f;
+      bool const kv_dual = wg_idx < NUM_Q_PER_KV && warp_id == 0;
+      // The K/V block's epilogue operands, loaded ahead of the MFMA loop so
+      // it covers their latency: its 4 biases (right after the Q biases at
+      // NUM_Q_PER_KV*OUTPUT_PER_WG + block*16), and for K lanes g < 2 the
+      // cos/sin of their 4 dims.
+      // Loaded inside the dual-chain asm (global_load into its outputs): a
+      // C++ load here lands in registers that asm clobbers, and the compiler
+      // then waits for it before the loop just to move it.
+      uint64_t kv_bias4 = 0, kv_cos4 = 0, kv_sin4 = 0;
+      int const kv_d = 8 * (wg_idx & 3) + (g & 1) * 4;
+      long long const kv_cs = (long long)s_global_pos[0] * HEAD_DIM + kv_d;
+      unsigned long long const kv_pb = (unsigned long long)(
+          d_bias + NUM_Q_PER_KV * OUTPUT_PER_WG + wg_idx * 16 + g * 4);
+      unsigned long long const kv_pc =
+          (unsigned long long)((unsigned short const *)cos_ptr + kv_cs);
+      unsigned long long const kv_ps =
+          (unsigned long long)((unsigned short const *)sin_ptr + kv_cs);
+#endif
+      {
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+#if defined(MPK_KV_SPREAD) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||              \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_MFMA_UNROLLED)
+#error "MPK_ABLATE_QKV_KMAJOR_ADDR is wired for the PF_BEFORE_WAIT single-chain loop"
+#endif
+        unsigned w_addr = (unsigned)(uintptr_t)(lds_wd + lane_id * 16);
+#else
+        unsigned w_addr =
+            (unsigned)(uintptr_t)(lds_wd + col * ROW_DATA + g * 16);
+#endif
+        unsigned ws_addr = (unsigned)(uintptr_t)(lds_ws + col * ROW_SCALE + g);
+        // B operand: lane (g, col) reads token row `col`. Inactive lanes clamp
+        // to row 0 rather than skipping -- see the exec-mask note in
+        // _kvupd_rope_epilogue_packed.
+        int const b_row = tok_active ? col : 0;
+        unsigned t_addr =
+            (unsigned)(uintptr_t)(s_tok_fp8 + b_row * TOK_ROW_STRIDE + g * 16);
+        unsigned ts_addr =
+            (unsigned)(uintptr_t)(s_tok_scales + b_row * SC_STRIDE);
+#ifdef MPK_VTN_QPAIR
+        if (pcol) {
+          t_addr = (unsigned)(uintptr_t)(s_tok2 + g * 16);
+          ts_addr = (unsigned)(uintptr_t)(s_tsc2);
+        }
+#ifdef MPK_VTN_QTRI
+        if (pcol == 2) {
+          t_addr = (unsigned)(uintptr_t)(s_tok3 + g * 16);
+          ts_addr = (unsigned)(uintptr_t)(s_tsc3);
+        }
+#endif
+#endif
+#ifdef MPK_QKV_KSPLIT
+        // Start this part's K-range at the natural LDS offset so the other
+        // half's hole stays where the full-K layout put it. k_part 1 can
+        // then reuse the same ping-pong loop with a shorter trip count.
+        w_addr += (unsigned)(k_iter0 * 64);
+        ws_addr += (unsigned)(k_iter0 * 4);
+        t_addr += (unsigned)(k_iter0 * 0x80);
+        ts_addr += (unsigned)k_iter0;
+        // k_part is a runtime argument in the fused kernel, so nki-1 is a
+        // VGPR. s_cmp_lt_i32 needs an SGPR; the assembler rejects
+        // `s_cmp_lt_i32 s13, v0`. Lane 0's value is uniform per workgroup.
+        int iters_m1_sgpr;
+        asm volatile("v_readfirstlane_b32 %0, %1"
+                     : "=s"(iters_m1_sgpr)
+                     : "v"(iters_m1_val));
+#endif
+
+#ifdef MPK_KV_SPREAD
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_MFMA_UNROLLED) ||             \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_TSC_PTR_INCREMENT) ||   \
+    defined(MPK_QKV_ACC_UNDER_LDS) || !defined(MPK_QKV_PF_BEFORE_WAIT) ||      \
+    !defined(MPK_QKV_PREFETCH_SCALES) || defined(MPK_QKV_DMA_IN_SLAB) ||       \
+    defined(MPK_ABLATE_KV_EXTRA) || defined(MPK_ABLATE_QKV_DMA)
+#error "MPK_KV_SPREAD is wired for the shipped QKV loop (PF_BEFORE_WAIT, PREFETCH_SCALES, unsplit)"
+#endif
+        static_assert(G::TOK_ROWS == 1 && OUTPUT_PER_WG == 64 &&
+                          HEAD_DIM == 64 && NUM_Q_PER_KV == 8,
+                      "MPK_KV_SPREAD: batch 1, 64-row tiles, 8 Q heads per KV");
+        static_assert(G::W_END + G::TILE_BYTES <= 149 * 1024,
+                      "MPK_KV_SPREAD: LDS slot NUM_WAVES must fit");
+        if (kv_dual) {
+          uint8_t *lds_kv = lds_qkv_base + NUM_WAVES * QKV_TILE_BYTES;
+          i32x4_t kv_a2b0, kv_a2b1;
+          int kv_a2s0, kv_a2s1;
+          unsigned w2_addr =
+              (unsigned)(uintptr_t)(lds_kv + col * ROW_DATA + g * 16);
+          unsigned ws2_addr = (unsigned)(uintptr_t)(
+              lds_kv + QKV_TILE_DATA_PADDED + col * ROW_SCALE + g);
+          // The loop below with a second accumulator a[4:7] and its own A
+          // banks (v[40:43]/v50 and v[44:47]/v51); B is shared. Each half-step
+          // issues the next A1 stripe, waits for the current bank, runs
+          // MFMA 1, issues the next B and A2 stripes, then runs MFMA 2, so
+          // every prefetch is issued after the MFMA that last read its
+          // registers, as in the single-chain ping-pong.
+#ifdef MPK_KV_SPREAD_A2REG
+#ifdef MPK_QKV_B_MASK
+#error "MPK_KV_SPREAD_A2REG does not implement MPK_QKV_B_MASK"
+#endif
+          static_assert(MFMA_ITERS == 23,
+                        "MPK_KV_SPREAD_A2REG is generated for 23 K-steps");
+          asm volatile(
+              "global_load_dwordx2 %[kb], %[pb], off\n"
+              "global_load_dwordx2 %[kc], %[pc], off\n"
+              "global_load_dwordx2 %[ks], %[ps], off\n"
+              "v_accvgpr_write_b32 a0, 0\n"
+              "v_accvgpr_write_b32 a1, 0\n"
+              "v_accvgpr_write_b32 a2, 0\n"
+              "v_accvgpr_write_b32 a3, 0\n"
+              "v_accvgpr_write_b32 a4, 0\n"
+              "v_accvgpr_write_b32 a5, 0\n"
+              "v_accvgpr_write_b32 a6, 0\n"
+              "v_accvgpr_write_b32 a7, 0\n"
+              "ds_read_b128 v[52:55], %[w2a] offset:0\n"
+              "ds_read_b128 v[56:59], %[w2a] offset:64\n"
+              "ds_read_b128 v[60:63], %[w2a] offset:128\n"
+              "ds_read_b128 v[64:67], %[w2a] offset:192\n"
+              "ds_read_b128 v[68:71], %[w2a] offset:256\n"
+              "ds_read_b128 v[72:75], %[w2a] offset:320\n"
+              "ds_read_b128 v[76:79], %[w2a] offset:384\n"
+              "ds_read_b128 v[80:83], %[w2a] offset:448\n"
+              "ds_read_b128 v[84:87], %[w2a] offset:512\n"
+              "ds_read_b128 v[88:91], %[w2a] offset:576\n"
+              "ds_read_b128 v[92:95], %[w2a] offset:640\n"
+              "ds_read_b128 v[96:99], %[w2a] offset:704\n"
+              "ds_read_b128 v[100:103], %[w2a] offset:768\n"
+              "ds_read_b128 v[104:107], %[w2a] offset:832\n"
+              "ds_read_b128 v[108:111], %[w2a] offset:896\n"
+              "ds_read_b128 v[112:115], %[w2a] offset:960\n"
+              "ds_read_b128 v[116:119], %[w2a] offset:1024\n"
+              "ds_read_b128 v[120:123], %[w2a] offset:1088\n"
+              "ds_read_b128 v[124:127], %[w2a] offset:1152\n"
+              "ds_read_b128 v[128:131], %[w2a] offset:1216\n"
+              "ds_read_b128 v[132:135], %[w2a] offset:1280\n"
+              "ds_read_b128 v[136:139], %[w2a] offset:1344\n"
+              "ds_read_b128 v[140:143], %[w2a] offset:1408\n"
+              "ds_read_u8   v144, %[ws2a] offset:0\n"
+              "ds_read_u8   v145, %[ws2a] offset:4\n"
+              "ds_read_u8   v146, %[ws2a] offset:8\n"
+              "ds_read_u8   v147, %[ws2a] offset:12\n"
+              "ds_read_u8   v148, %[ws2a] offset:16\n"
+              "ds_read_u8   v149, %[ws2a] offset:20\n"
+              "ds_read_u8   v150, %[ws2a] offset:24\n"
+              "ds_read_u8   v151, %[ws2a] offset:28\n"
+              "ds_read_u8   v152, %[ws2a] offset:32\n"
+              "ds_read_u8   v153, %[ws2a] offset:36\n"
+              "ds_read_u8   v154, %[ws2a] offset:40\n"
+              "ds_read_u8   v155, %[ws2a] offset:44\n"
+              "ds_read_u8   v156, %[ws2a] offset:48\n"
+              "ds_read_u8   v157, %[ws2a] offset:52\n"
+              "ds_read_u8   v158, %[ws2a] offset:56\n"
+              "ds_read_u8   v159, %[ws2a] offset:60\n"
+              "ds_read_u8   v160, %[ws2a] offset:64\n"
+              "ds_read_u8   v161, %[ws2a] offset:68\n"
+              "ds_read_u8   v162, %[ws2a] offset:72\n"
+              "ds_read_u8   v163, %[ws2a] offset:76\n"
+              "ds_read_u8   v164, %[ws2a] offset:80\n"
+              "ds_read_u8   v165, %[ws2a] offset:84\n"
+              "ds_read_u8   v166, %[ws2a] offset:88\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, %[tsa]\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 1, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[52:55], v[8:15], a[4:7], v144, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 2, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[56:59], v[32:39], a[4:7], v145, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 3, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[60:63], v[8:15], a[4:7], v146, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 4, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[64:67], v[32:39], a[4:7], v147, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 5, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[68:71], v[8:15], a[4:7], v148, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 6, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[72:75], v[32:39], a[4:7], v149, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 7, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[76:79], v[8:15], a[4:7], v150, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 8, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[80:83], v[32:39], a[4:7], v151, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 9, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[84:87], v[8:15], a[4:7], v152, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 10, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[88:91], v[32:39], a[4:7], v153, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 11, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[92:95], v[8:15], a[4:7], v154, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 12, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[96:99], v[32:39], a[4:7], v155, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 13, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[100:103], v[8:15], a[4:7], v156, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 14, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[104:107], v[32:39], a[4:7], v157, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 15, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[108:111], v[8:15], a[4:7], v158, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 16, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[112:115], v[32:39], a[4:7], v159, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 17, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[116:119], v[8:15], a[4:7], v160, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 18, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[120:123], v[32:39], a[4:7], v161, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 19, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[124:127], v[8:15], a[4:7], v162, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 20, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[128:131], v[32:39], a[4:7], v163, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 21, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v19, v17\n"
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[132:135], v[8:15], a[4:7], v164, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 v17, 22, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "ds_read_u8   v16, v17\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[136:139], v[32:39], a[4:7], v165, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], v[140:143], v[8:15], a[4:7], v166, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              MPK_MFMA_TAIL_PAD
+              MPK_MFMA_TAIL_PAD
+              "v_accvgpr_read_b32 %[acc0], a0\n"
+              "v_accvgpr_read_b32 %[acc1], a1\n"
+              "v_accvgpr_read_b32 %[acc2], a2\n"
+              "v_accvgpr_read_b32 %[acc3], a3\n"
+              "v_accvgpr_read_b32 %[bcc0], a4\n"
+              "v_accvgpr_read_b32 %[bcc1], a5\n"
+              "v_accvgpr_read_b32 %[bcc2], a6\n"
+              "v_accvgpr_read_b32 %[bcc3], a7\n"
+              "s_waitcnt vmcnt(0)\n"
+              : [acc0] "=v"(qa0), [acc1] "=v"(qa1), [acc2] "=v"(qa2),
+                [acc3] "=v"(qa3), [bcc0] "=v"(qb0), [bcc1] "=v"(qb1),
+                [bcc2] "=v"(qb2), [bcc3] "=v"(qb3), [wa] "+v"(w_addr),
+                [wsa] "+v"(ws_addr), [ta] "+v"(t_addr), [kb] "=&v"(kv_bias4),
+                [kc] "=&v"(kv_cos4), [ks] "=&v"(kv_sin4)
+              : [tsa] "v"(ts_addr), [w2a] "v"(w2_addr), [ws2a] "v"(ws2_addr),
+                [pb] "v"(kv_pb), [pc] "v"(kv_pc), [ps] "v"(kv_ps)
+              : "memory", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v52", "v53", "v54", "v55", "v56", "v57", "v58", "v59", "v60", "v61", "v62", "v63", "v64", "v65", "v66", "v67", "v68", "v69", "v70", "v71", "v72", "v73", "v74", "v75", "v76", "v77", "v78", "v79", "v80", "v81", "v82", "v83", "v84", "v85", "v86", "v87", "v88", "v89", "v90", "v91", "v92", "v93", "v94", "v95", "v96", "v97", "v98", "v99", "v100", "v101", "v102", "v103", "v104", "v105", "v106", "v107", "v108", "v109", "v110", "v111", "v112", "v113", "v114", "v115", "v116", "v117", "v118", "v119", "v120", "v121", "v122", "v123", "v124", "v125", "v126", "v127", "v128", "v129", "v130", "v131", "v132", "v133", "v134", "v135", "v136", "v137", "v138", "v139", "v140", "v141", "v142", "v143", "v144", "v145", "v146", "v147", "v148", "v149", "v150", "v151", "v152", "v153", "v154", "v155", "v156", "v157", "v158", "v159", "v160", "v161", "v162", "v163", "v164", "v165", "v166", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7");
+#else
+          asm volatile(
+              "global_load_dwordx2 %[kb], %[pb], off\n"
+              "global_load_dwordx2 %[kc], %[pc], off\n"
+              "global_load_dwordx2 %[ks], %[ps], off\n"
+              "v_accvgpr_write_b32 a0, 0\n"
+              "v_accvgpr_write_b32 a1, 0\n"
+              "v_accvgpr_write_b32 a2, 0\n"
+              "v_accvgpr_write_b32 a3, 0\n"
+              "v_accvgpr_write_b32 a4, 0\n"
+              "v_accvgpr_write_b32 a5, 0\n"
+              "v_accvgpr_write_b32 a6, 0\n"
+              "v_accvgpr_write_b32 a7, 0\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, %[tsa]\n"
+              "ds_read_b128 %[a2b0], %[w2a]\n"
+              "ds_read_u8   %[a2s0], %[ws2a]\n"
+              "s_mov_b32 s13, 0\n"
+              "KVD_LOOP_%=:\n"
+              // ---- consume bank 0, prefetch into bank 1 ----
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 %[w2a], 64, %[w2a]\n"
+              "v_add_u32_e32 %[ws2a], 4, %[ws2a]\n"
+              "s_add_i32 s13, s13, 1\n"
+              "v_add_u32_e32 v17, s13, %[tsa]\n"
+              "ds_read_b128 v[26:29], %[wa]\n"
+              "ds_read_u8   v18, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+              "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_ON
+#endif
+              "ds_read_b128 v[32:35], %[ta]\n"
+              "ds_read_b128 v[36:39], %[ta] offset:64\n"
+              "ds_read_u8   v19, v17\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_OFF
+#endif
+              "ds_read_b128 %[a2b1], %[w2a]\n"
+              "ds_read_u8   %[a2s1], %[ws2a]\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b0], v[8:15], "
+              "a[4:7], %[a2s0], v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+              "s_cbranch_scc0 KVD_TAIL_B1_%=\n"
+              // ---- consume bank 1, prefetch into bank 0 ----
+              "v_add_u32_e32 %[wa], 64, %[wa]\n"
+              "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+              "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+              "v_add_u32_e32 %[w2a], 64, %[w2a]\n"
+              "v_add_u32_e32 %[ws2a], 4, %[ws2a]\n"
+              "s_add_i32 s13, s13, 1\n"
+              "v_add_u32_e32 v17, s13, %[tsa]\n"
+              "ds_read_b128 v[22:25], %[wa]\n"
+              "ds_read_u8   v7, %[wsa]\n"
+              "s_waitcnt lgkmcnt(2)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_ON
+#endif
+              "ds_read_b128 v[8:11], %[ta]\n"
+              "ds_read_b128 v[12:15], %[ta] offset:64\n"
+              "ds_read_u8   v16, v17\n"
+#ifdef MPK_QKV_B_MASK
+              MPK_QKV_B_MASK_OFF
+#endif
+              "ds_read_b128 %[a2b0], %[w2a]\n"
+              "ds_read_u8   %[a2s0], %[ws2a]\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b1], v[32:39], "
+              "a[4:7], %[a2s1], v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+              "s_cbranch_scc1 KVD_LOOP_%=\n"
+              // Both tails, as below: odd MFMA_ITERS leaves through here.
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+              "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b0], v[8:15], "
+              "a[4:7], %[a2s0], v16 op_sel_hi:[0,0,0] cbsz:4\n"
+              "s_branch KVD_ACC_%=\n"
+              "KVD_TAIL_B1_%=:\n"
+              "s_waitcnt lgkmcnt(0)\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+              "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "v_mfma_scale_f32_16x16x128_f8f6f4 a[4:7], %[a2b1], v[32:39], "
+              "a[4:7], %[a2s1], v19 op_sel_hi:[0,0,0] cbsz:4\n"
+              "KVD_ACC_%=:\n"
+              // Two 32-cycle MFMAs may still be in flight.
+              MPK_MFMA_TAIL_PAD
+              MPK_MFMA_TAIL_PAD
+              "v_accvgpr_read_b32 %[acc0], a0\n"
+              "v_accvgpr_read_b32 %[acc1], a1\n"
+              "v_accvgpr_read_b32 %[acc2], a2\n"
+              "v_accvgpr_read_b32 %[acc3], a3\n"
+              "v_accvgpr_read_b32 %[bcc0], a4\n"
+              "v_accvgpr_read_b32 %[bcc1], a5\n"
+              "v_accvgpr_read_b32 %[bcc2], a6\n"
+              "v_accvgpr_read_b32 %[bcc3], a7\n"
+              "s_waitcnt vmcnt(0)\n"
+              : [acc0] "=v"(qa0),
+                [acc1] "=v"(qa1),
+                [acc2] "=v"(qa2),
+                [acc3] "=v"(qa3),
+                [bcc0] "=v"(qb0),
+                [bcc1] "=v"(qb1),
+                [bcc2] "=v"(qb2),
+                [bcc3] "=v"(qb3),
+                [wa] "+v"(w_addr),
+                [wsa] "+v"(ws_addr),
+                [ta] "+v"(t_addr),
+                [w2a] "+v"(w2_addr),
+                [ws2a] "+v"(ws2_addr),
+                [kb] "=&v"(kv_bias4),
+                [kc] "=&v"(kv_cos4),
+                [ks] "=&v"(kv_sin4),
+                [a2b0] "=&v"(kv_a2b0),
+                [a2b1] "=&v"(kv_a2b1),
+                [a2s0] "=&v"(kv_a2s0),
+                [a2s1] "=&v"(kv_a2s1)
+#ifdef MPK_QKV_B_MASK
+                ,
+                [bsv] "=&s"(qkv_bsv)
+#endif
+              : [tsa] "v"(ts_addr), [iters_m1] "n"(MFMA_ITERS - 1),
+                [pb] "v"(kv_pb), [pc] "v"(kv_pc), [ps] "v"(kv_ps)
+              : "memory", "s13", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+                "v14", "v15", "v16", "v17", "v18", "v19", "v22", "v23", "v24",
+                "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35",
+                "v36", "v37", "v38", "v39", "a0", "a1", "a2", "a3", "a4",
+                "a5", "a6", "a7");
+#endif
+        } else
+#endif
+#ifdef MPK_QKV_PF3
+#if defined(MPK_QKV_KSPLIT) || defined(MPK_QKV_MFMA_UNROLLED) ||             \
+    defined(MPK_QKV_DS_BEFORE_ADDR) || defined(MPK_QKV_TSC_PTR_INCREMENT) ||   \
+    defined(MPK_QKV_ACC_UNDER_LDS) || defined(MPK_QKV_B_MASK) ||               \
+    defined(MPK_ABLATE_QKV_KMAJOR_ADDR) || defined(MPK_KV_SPREAD)
+#error "MPK_QKV_PF3 replaces the shipped single-chain loop only"
+#endif
+        static_assert(MFMA_ITERS == 23,
+                      "MPK_QKV_PF3 is generated for 23 K-steps");
+        asm volatile(
+            "v_accvgpr_write_b32 a0, 0\n"
+            "v_accvgpr_write_b32 a1, 0\n"
+            "v_accvgpr_write_b32 a2, 0\n"
+            "v_accvgpr_write_b32 a3, 0\n"
+            "ds_read_b128 v[22:25], %[wa] offset:0\n"
+            "ds_read_u8   v7, %[wsa] offset:0\n"
+            "ds_read_b128 v[8:11], %[ta] offset:0\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+            "ds_read_u8   v16, %[tsa] offset:0\n"
+            "ds_read_b128 v[26:29], %[wa] offset:64\n"
+            "ds_read_u8   v18, %[wsa] offset:4\n"
+            "ds_read_b128 v[32:35], %[ta] offset:128\n"
+            "ds_read_b128 v[36:39], %[ta] offset:192\n"
+            "ds_read_u8   v19, %[tsa] offset:1\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:128\n"
+            "ds_read_u8   v52, %[wsa] offset:8\n"
+            "ds_read_b128 v[40:43], %[ta] offset:256\n"
+            "ds_read_b128 v[44:47], %[ta] offset:320\n"
+            "ds_read_u8   v53, %[tsa] offset:2\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:192\n"
+            "ds_read_u8   v7, %[wsa] offset:12\n"
+            "ds_read_b128 v[8:11], %[ta] offset:384\n"
+            "ds_read_b128 v[12:15], %[ta] offset:448\n"
+            "ds_read_u8   v16, %[tsa] offset:3\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:256\n"
+            "ds_read_u8   v18, %[wsa] offset:16\n"
+            "ds_read_b128 v[32:35], %[ta] offset:512\n"
+            "ds_read_b128 v[36:39], %[ta] offset:576\n"
+            "ds_read_u8   v19, %[tsa] offset:4\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:320\n"
+            "ds_read_u8   v52, %[wsa] offset:20\n"
+            "ds_read_b128 v[40:43], %[ta] offset:640\n"
+            "ds_read_b128 v[44:47], %[ta] offset:704\n"
+            "ds_read_u8   v53, %[tsa] offset:5\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:384\n"
+            "ds_read_u8   v7, %[wsa] offset:24\n"
+            "ds_read_b128 v[8:11], %[ta] offset:768\n"
+            "ds_read_b128 v[12:15], %[ta] offset:832\n"
+            "ds_read_u8   v16, %[tsa] offset:6\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:448\n"
+            "ds_read_u8   v18, %[wsa] offset:28\n"
+            "ds_read_b128 v[32:35], %[ta] offset:896\n"
+            "ds_read_b128 v[36:39], %[ta] offset:960\n"
+            "ds_read_u8   v19, %[tsa] offset:7\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:512\n"
+            "ds_read_u8   v52, %[wsa] offset:32\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1024\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1088\n"
+            "ds_read_u8   v53, %[tsa] offset:8\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:576\n"
+            "ds_read_u8   v7, %[wsa] offset:36\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1152\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1216\n"
+            "ds_read_u8   v16, %[tsa] offset:9\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:640\n"
+            "ds_read_u8   v18, %[wsa] offset:40\n"
+            "ds_read_b128 v[32:35], %[ta] offset:1280\n"
+            "ds_read_b128 v[36:39], %[ta] offset:1344\n"
+            "ds_read_u8   v19, %[tsa] offset:10\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:704\n"
+            "ds_read_u8   v52, %[wsa] offset:44\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1408\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1472\n"
+            "ds_read_u8   v53, %[tsa] offset:11\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:768\n"
+            "ds_read_u8   v7, %[wsa] offset:48\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1536\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1600\n"
+            "ds_read_u8   v16, %[tsa] offset:12\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:832\n"
+            "ds_read_u8   v18, %[wsa] offset:52\n"
+            "ds_read_b128 v[32:35], %[ta] offset:1664\n"
+            "ds_read_b128 v[36:39], %[ta] offset:1728\n"
+            "ds_read_u8   v19, %[tsa] offset:13\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:896\n"
+            "ds_read_u8   v52, %[wsa] offset:56\n"
+            "ds_read_b128 v[40:43], %[ta] offset:1792\n"
+            "ds_read_b128 v[44:47], %[ta] offset:1856\n"
+            "ds_read_u8   v53, %[tsa] offset:14\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:960\n"
+            "ds_read_u8   v7, %[wsa] offset:60\n"
+            "ds_read_b128 v[8:11], %[ta] offset:1920\n"
+            "ds_read_b128 v[12:15], %[ta] offset:1984\n"
+            "ds_read_u8   v16, %[tsa] offset:15\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1024\n"
+            "ds_read_u8   v18, %[wsa] offset:64\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2048\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2112\n"
+            "ds_read_u8   v19, %[tsa] offset:16\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:1088\n"
+            "ds_read_u8   v52, %[wsa] offset:68\n"
+            "ds_read_b128 v[40:43], %[ta] offset:2176\n"
+            "ds_read_b128 v[44:47], %[ta] offset:2240\n"
+            "ds_read_u8   v53, %[tsa] offset:17\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:1152\n"
+            "ds_read_u8   v7, %[wsa] offset:72\n"
+            "ds_read_b128 v[8:11], %[ta] offset:2304\n"
+            "ds_read_b128 v[12:15], %[ta] offset:2368\n"
+            "ds_read_u8   v16, %[tsa] offset:18\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1216\n"
+            "ds_read_u8   v18, %[wsa] offset:76\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2432\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2496\n"
+            "ds_read_u8   v19, %[tsa] offset:19\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[48:51], %[wa] offset:1280\n"
+            "ds_read_u8   v52, %[wsa] offset:80\n"
+            "ds_read_b128 v[40:43], %[ta] offset:2560\n"
+            "ds_read_b128 v[44:47], %[ta] offset:2624\n"
+            "ds_read_u8   v53, %[tsa] offset:20\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[22:25], %[wa] offset:1344\n"
+            "ds_read_u8   v7, %[wsa] offset:84\n"
+            "ds_read_b128 v[8:11], %[ta] offset:2688\n"
+            "ds_read_b128 v[12:15], %[ta] offset:2752\n"
+            "ds_read_u8   v16, %[tsa] offset:21\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[48:51], v[40:47], a[0:3], v52, v53 op_sel_hi:[0,0,0] cbsz:4\n"
+            "ds_read_b128 v[26:29], %[wa] offset:1408\n"
+            "ds_read_u8   v18, %[wsa] offset:88\n"
+            "ds_read_b128 v[32:35], %[ta] offset:2816\n"
+            "ds_read_b128 v[36:39], %[ta] offset:2880\n"
+            "ds_read_u8   v19, %[tsa] offset:22\n"
+            "s_waitcnt lgkmcnt(5)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+            MPK_MFMA_TAIL_PAD
+            "v_accvgpr_read_b32 %[acc0], a0\n"
+            "v_accvgpr_read_b32 %[acc1], a1\n"
+            "v_accvgpr_read_b32 %[acc2], a2\n"
+            "v_accvgpr_read_b32 %[acc3], a3\n"
+            : [acc0] "=v"(qa0), [acc1] "=v"(qa1), [acc2] "=v"(qa2),
+              [acc3] "=v"(qa3)
+            : [wa] "v"(w_addr), [wsa] "v"(ws_addr), [ta] "v"(t_addr),
+              [tsa] "v"(ts_addr)
+            : "memory", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v18", "v19", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v32", "v33", "v34", "v35", "v36", "v37", "v38", "v39", "v40", "v41", "v42", "v43", "v44", "v45", "v46", "v47", "v48", "v49", "v50", "v51", "v52", "v53", "a0", "a1", "a2", "a3");
+        if (false)
+#endif
+#ifdef MPK_ABLATE_QKV_HALF_WAVES
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3)
+#error "MPK_ABLATE_QKV_HALF_WAVES is wired for the shipped single-chain loop"
+#endif
+        if (warp_id >= 2) {
+          qa0 = qa1 = qa2 = qa3 = 0.f;
+        } else
+#endif
+        asm volatile(
+#ifdef MPK_QKV_EPI_PRELOAD
+            "global_load_dwordx2 %[eb], %[pb], off\n"
+            "global_load_ushort %[ec], %[pc], off\n"
+            "global_load_ushort %[es], %[ps], off\n"
+#endif
+#ifdef MPK_QKV_ROPE_REG
+            "global_load_dwordx2 %[eb], %[pb], off\n"
+            "global_load_dwordx2 %[ec], %[pc], off\n"
+            "global_load_dwordx2 %[es], %[ps], off\n"
+#endif
+#ifndef MPK_QKV_ACC_UNDER_LDS
+            // Zero accumulator
+            "v_accvgpr_write_b32 a0, 0\n"
+            "v_accvgpr_write_b32 a1, 0\n"
+            "v_accvgpr_write_b32 a2, 0\n"
+            "v_accvgpr_write_b32 a3, 0\n"
+#endif
+
+            // ── Two disjoint operand banks (see below) ──
+            //   Bank 0: A v[22:25], A scale v7,  B v[8:15],  B scale v16
+            //   Bank 1: A v[26:29], A scale v18, B v[32:39], B scale v19
+            //   Address scratch v17, accumulator a[0:3].
+            //
+            // The loop MUST NOT prefetch into the registers the current MFMA
+            // reads as sources. lgkmcnt tracks when LDS data lands in the
+            // VGPR; it says nothing about when the MFMA has finished sampling
+            // its operands, and a 16x16x128 MFMA streams them over the op's
+            // duration rather than latching at issue. Overwriting in place is
+            // therefore a WAR race: when LDS returns fast the write-back lands
+            // mid-MFMA and the op sees mixed-iteration operands. Measured at
+            // ~17-22% of launches wrong before banking.
+            //
+            // Ping-pong rule: while the MFMA consumes bank X, the prefetch
+            // writes bank 1-X. No register is ever both a live MFMA source and
+            // an in-flight LDS destination, so the race cannot occur.
+            //
+            // Verified by tests/standalone/test_mfma_pipeline_hazards.hip.
+
+            // Pre-issue 5 reads for iteration 0 into bank 0
+            "ds_read_b128 v[22:25], %[wa]\n"           // weight A (16B FP4)
+            "ds_read_u8   v7, %[wsa]\n"                // weight A scale
+            "ds_read_b128 v[8:11], %[ta]\n"            // token B lo (16B FP8)
+            "ds_read_b128 v[12:15], %[ta] offset:64\n" // token B hi (16B FP8)
+            "ds_read_u8   v16, %[tsa]\n" // token B scale
+#ifdef MPK_QKV_ACC_UNDER_LDS
+            // AccVGPR zeros do not depend on bank 0. Issue them after the
+            // five ds_reads so they hide under the first-iter LDS wait.
+            "v_accvgpr_write_b32 a0, 0\n"
+            "v_accvgpr_write_b32 a1, 0\n"
+            "v_accvgpr_write_b32 a2, 0\n"
+            "v_accvgpr_write_b32 a3, 0\n"
+#endif
+
+// ── MFMA_ITERS-1 in-loop MFMAs, alternating banks ──
+//
+// MPK_QKV_MFMA_UNROLLED: MFMA_ITERS is a compile-time constant, so the
+// scalar loop control is doing runtime work to recompute something the
+// assembler already knows. `.rept` emits the same bank-0/bank-1 pair
+// (MFMA_ITERS-1)/2 times and an assembler symbol carries the token-scale
+// offset, which removes per pair: two s_add_i32, two s_cmpk_lt_i32, one
+// s_cbranch_scc0, one s_cbranch_scc1 and one s_branch -- and, more to the
+// point, takes the taken-branch bubble off the end of every pair.
+//
+// The unrolled arm also drops the dual-tail hedge below: with a constant
+// trip count the exit parity is known here, so only the bank-0 final MFMA
+// is reachable. That is what the static_assert pins.
+#ifdef MPK_QKV_MFMA_UNROLLED
+            ".set MPK_QKV_TSC_%=, 1\n"
+            ".rept %[unroll_pairs]\n"
+#else
+            "s_mov_b32 s13, 0\n" // loop counter
+            "PIPELINED_QKV_%=:\n"
+#endif
+
+            // ---- consume bank 0, prefetch into bank 1 ----
+#ifdef MPK_QKV_PF_BEFORE_WAIT
+#if defined(MPK_QKV_IMM)
+            // Iteration TSC into bank 1 at immediate offsets; the base registers stay put.
+            "ds_read_u8   v19, %[tsa] offset:MPK_QKV_TSC_%=\n"
+            "ds_read_b128 v[26:29], %[wa] offset:(MPK_QKV_TSC_%= * 64)\n"
+            "ds_read_u8   v18, %[wsa] offset:(MPK_QKV_TSC_%= * 4)\n"
+            "ds_read_b128 v[32:35], %[ta] offset:(MPK_QKV_TSC_%= * 0x80)\n"
+            "ds_read_b128 v[36:39], %[ta] offset:(MPK_QKV_TSC_%= * 0x80 + 64)\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#elif defined(MPK_QKV_DS_BEFORE_ADDR)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+            "ds_read_u8   v19, v17\n"
+            "ds_read_b128 v[26:29], %[wa] offset:64\n"
+            "ds_read_u8   v18, %[wsa] offset:4\n"
+            "ds_read_b128 v[32:35], %[ta] offset:0x80\n"
+            "ds_read_b128 v[36:39], %[ta] offset:0xc0\n"
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+            "s_waitcnt lgkmcnt(5)\n"
+#else
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+            "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
+#else
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+#endif
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%=, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v19, %[tsa]\n"
+#elif !defined(MPK_QKV_B_MASK)
+            "ds_read_u8   v19, v17\n"
+#endif
+            "ds_read_b128 v[26:29], %[wa]\n"
+            "ds_read_u8   v18, %[wsa]\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_ON
+            "ds_read_u8   v19, v17\n"
+#endif
+            "ds_read_b128 v[32:35], %[ta]\n"
+            "ds_read_b128 v[36:39], %[ta] offset:64\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_OFF
+#endif
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#else
+            "s_waitcnt lgkmcnt(0)\n" // bank 0 operands resident
+
+            // Advance addresses for the next iteration
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%=, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            // The scalar loop counter still drives the loop branch, but the
+            // token-scale LDS address is its own monotonic byte pointer.
+            // Advancing it directly removes the s13 -> VALU dependency in
+            // front of ds_read_u8 without changing any requested address.
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v19, %[tsa]\n" // B scale  -> bank 1
+#else
+            "ds_read_u8   v19, v17\n"                  // B scale  -> bank 1
+#endif
+            "ds_read_b128 v[26:29], %[wa]\n"           // A data   -> bank 1
+            "ds_read_u8   v18, %[wsa]\n"               // A scale  -> bank 1
+            "ds_read_b128 v[32:35], %[ta]\n"           // B lo     -> bank 1
+            "ds_read_b128 v[36:39], %[ta] offset:64\n" // B hi     -> bank 1
+#endif
+
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+            "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+
+#ifndef MPK_QKV_MFMA_UNROLLED
+#ifndef MPK_QKV_KSPLIT
+            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+#else
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
+#endif
+            "s_cbranch_scc0 QKV_TAIL_B1_%=\n"
+#endif
+
+            // ---- consume bank 1, prefetch into bank 0 ----
+#ifdef MPK_QKV_PF_BEFORE_WAIT
+#if defined(MPK_QKV_IMM)
+            // Iteration TSC + 1 into bank 0.
+            "ds_read_u8   v16, %[tsa] offset:(MPK_QKV_TSC_%= + 1)\n"
+            "ds_read_b128 v[22:25], %[wa] offset:((MPK_QKV_TSC_%= + 1) * 64)\n"
+            "ds_read_u8   v7, %[wsa] offset:((MPK_QKV_TSC_%= + 1) * 4)\n"
+            "ds_read_b128 v[8:11], %[ta] offset:((MPK_QKV_TSC_%= + 1) * 0x80)\n"
+            "ds_read_b128 v[12:15], %[ta] offset:((MPK_QKV_TSC_%= + 1) * 0x80 + 64)\n"
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#elif defined(MPK_QKV_DS_BEFORE_ADDR)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+            "ds_read_u8   v16, v17\n"
+            "ds_read_b128 v[22:25], %[wa] offset:64\n"
+            "ds_read_u8   v7, %[wsa] offset:4\n"
+            "ds_read_b128 v[8:11], %[ta] offset:0x80\n"
+            "ds_read_b128 v[12:15], %[ta] offset:0xc0\n"
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#else
+#ifdef MPK_ABLATE_QKV_KMAJOR_ADDR
+            "v_add_u32_e32 %[wa], 0x400, %[wa]\n"
+#else
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+#endif
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%= + 1, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v16, %[tsa]\n"
+#elif !defined(MPK_QKV_B_MASK)
+            "ds_read_u8   v16, v17\n"
+#endif
+            "ds_read_b128 v[22:25], %[wa]\n"
+            "ds_read_u8   v7, %[wsa]\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_ON
+            "ds_read_u8   v16, v17\n"
+#endif
+            "ds_read_b128 v[8:11], %[ta]\n"
+            "ds_read_b128 v[12:15], %[ta] offset:64\n"
+#ifdef MPK_QKV_B_MASK
+            MPK_QKV_B_MASK_OFF
+#endif
+#ifndef MPK_QKV_SKIP_B1_WAIT
+            "s_waitcnt lgkmcnt(5)\n"
+#endif
+#endif
+#else
+            "s_waitcnt lgkmcnt(0)\n" // bank 1 operands resident
+
+            "v_add_u32_e32 %[wa], 64, %[wa]\n"
+            "v_add_u32_e32 %[wsa], 4, %[wsa]\n"
+            "v_add_u32_e32 %[ta], 0x80, %[ta]\n"
+#ifdef MPK_QKV_MFMA_UNROLLED
+            "v_add_u32_e32 v17, MPK_QKV_TSC_%= + 1, %[tsa]\n"
+#elif defined(MPK_QKV_TSC_PTR_INCREMENT)
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 %[tsa], 1, %[tsa]\n"
+#else
+            "s_add_i32 s13, s13, 1\n"
+            "v_add_u32_e32 v17, s13, %[tsa]\n"
+#endif
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+            "ds_read_u8   v16, %[tsa]\n" // B scale  -> bank 0
+#else
+            "ds_read_u8   v16, v17\n"                  // B scale  -> bank 0
+#endif
+            "ds_read_b128 v[22:25], %[wa]\n"           // A data   -> bank 0
+            "ds_read_u8   v7, %[wsa]\n"                // A scale  -> bank 0
+            "ds_read_b128 v[8:11], %[ta]\n"            // B lo     -> bank 0
+            "ds_read_b128 v[12:15], %[ta] offset:64\n" // B hi     -> bank 0
+#endif
+
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+            "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+
+#ifdef MPK_QKV_MFMA_UNROLLED
+            ".set MPK_QKV_TSC_%=, MPK_QKV_TSC_%= + 2\n"
+            ".endr\n"
+
+            // ── Final MFMA (bank 0) ──
+            // (MFMA_ITERS-1)/2 pairs consumed an even number of iterations, so
+            // the odd one out is always iteration MFMA_ITERS-1, whose operands
+            // the last pair prefetched into bank 0.
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+            "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+#else
+#ifndef MPK_QKV_KSPLIT
+            "s_cmpk_lt_i32 s13, %[iters_m1]\n"
+#else
+            "s_cmp_lt_i32 s13, %[iters_m1]\n"
+#endif
+            "s_cbranch_scc1 PIPELINED_QKV_%=\n"
+
+            // ── Final MFMA ──
+            // Exit parity matters, so BOTH tails are emitted. In the live
+            // instantiation REDUCTION_SIZE is 2944, so MFMA_ITERS is 23 (odd)
+            // and the loop falls out of the bank 1 half with the final
+            // operands in BANK 0 -- this path. An even MFMA_ITERS exits via
+            // QKV_TAIL_B1 with the final operands in bank 1. Emitting only one
+            // tail would silently use the wrong bank for one of the two
+            // parities and reintroduce mixed-iteration operands.
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[22:25], v[8:15], "
+            "a[0:3], v7, v16 op_sel_hi:[0,0,0] cbsz:4\n"
+            "s_branch QKV_ACC_%=\n"
+
+            "QKV_TAIL_B1_%=:\n"
+            "s_waitcnt lgkmcnt(0)\n"
+            "v_mfma_scale_f32_16x16x128_f8f6f4 a[0:3], v[26:29], v[32:39], "
+            "a[0:3], v18, v19 op_sel_hi:[0,0,0] cbsz:4\n"
+
+            "QKV_ACC_%=:\n"
+#endif
+            // 32 clocks before reading the accumulator. The scaled MFMA is a
+            // 32-cycle op on CDNA4; the previous "s_nop 7; s_nop 0" was 9
+            // clocks (the correct wait for a 4-pass MFMA) and returned a
+            // partially-retired accumulator on every launch.
+            MPK_MFMA_TAIL_PAD
+            "v_accvgpr_read_b32 %[acc0], a0\n"
+            "v_accvgpr_read_b32 %[acc1], a1\n"
+            "v_accvgpr_read_b32 %[acc2], a2\n"
+            "v_accvgpr_read_b32 %[acc3], a3\n"
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+            "s_waitcnt vmcnt(0)\n"
+#endif
+            : [acc0] "=v"(qa0),
+              [acc1] "=v"(qa1),
+              [acc2] "=v"(qa2),
+              [acc3] "=v"(qa3),
+              [wa] "+v"(w_addr),
+              [wsa] "+v"(ws_addr),
+              [ta] "+v"(t_addr)
+#ifdef MPK_QKV_TSC_PTR_INCREMENT
+              ,
+              [tsa] "+v"(ts_addr)
+#endif
+#ifdef MPK_QKV_B_MASK
+              ,
+              [bsv] "=&s"(qkv_bsv)
+#endif
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+              ,
+              [eb] "=&v"(epi_b4),
+              [ec] "=&v"(epi_c),
+              [es] "=&v"(epi_s)
+#endif
+            :
+#ifndef MPK_QKV_TSC_PTR_INCREMENT
+              [tsa] "v"(ts_addr),
+#endif
+#ifdef MPK_QKV_KSPLIT
+              [iters_m1] "s"(iters_m1_sgpr),
+#else
+              [iters_m1] "n"(MFMA_ITERS - 1),
+#endif
+              [unroll_pairs] "n"((MFMA_ITERS - 1) / 2)
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+              ,
+              [pb] "v"(epi_pb),
+              [pc] "v"(epi_pc),
+              [ps] "v"(epi_ps)
+#endif
+            : "memory",
+              "s13",
+              "v7",
+              "v8",
+              "v9",
+              "v10",
+              "v11",
+              "v12",
+              "v13",
+              "v14",
+              "v15",
+              "v16",
+#ifndef MPK_QKV_TSC_PTR_INCREMENT
+              "v17",
+#endif
+              "v18",
+              "v19",
+              "v22",
+              "v23",
+              "v24",
+              "v25",
+              "v26",
+              "v27",
+              "v28",
+              "v29",
+              "v32",
+              "v33",
+              "v34",
+              "v35",
+              "v36",
+              "v37",
+              "v38",
+              "v39",
+              "a0",
+              "a1",
+              "a2",
+              "a3");
+      }
+#ifdef MPK_ABLATE_KV_EXTRA
+      if (tile_iter < _abl_extra) {
+        asm volatile("" ::"v"(qa0), "v"(qa1), "v"(qa2), "v"(qa3));
+        continue;
+      }
+#endif
+      f32x4_t acc;
+      acc[0] = qa0;
+      acc[1] = qa1;
+      acc[2] = qa2;
+      acc[3] = qa3;
+#ifdef MPK_KV_SPREAD
+      // This tile's K/V block (wave 0, second chain): lane (g, col) holds
+      // block rows g*4..g*4+3. Stored here so the stores overlap the Q
+      // epilogue below.
+      if (kv_dual && tok_active) {
+        float const qb[4] = {qb0, qb1, qb2, qb3};
+        unsigned short const *b4 = (unsigned short const *)&kv_bias4;
+        unsigned short val[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          unsigned bt = (unsigned)b4[i] << 16;
+          float bv;
+          __builtin_memcpy(&bv, &bt, 4);
+          val[i] = _gang_float_to_bf16(qb[i] + bv);
+        }
+        long long const kv_row =
+            (long long)s_dst_idx[0] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+            (long long)MPK_KV_HEAD_OFF(_kvupd_get_xcd_id(), HEAD_DIM);
+        if (wg_idx < 4) {
+          // K rows 0..7 of the block are dims 8*block+i and rows 8..15 their
+          // RoPE partners (host order), so lane g pairs with lane g ^ 2.
+          unsigned short pv[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            pv[i] = (unsigned short)__shfl_xor((int)val[i], 32, 64);
+          }
+          if (g < 2) {
+            unsigned short const *c4 = (unsigned short const *)&kv_cos4;
+            unsigned short const *s4 = (unsigned short const *)&kv_sin4;
+            unsigned short lo[4], hi[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              unsigned v0b = (unsigned)val[i] << 16;
+              unsigned v1b = (unsigned)pv[i] << 16;
+              float v0, v1;
+              __builtin_memcpy(&v0, &v0b, 4);
+              __builtin_memcpy(&v1, &v1b, 4);
+              unsigned cb = (unsigned)c4[i] << 16;
+              unsigned sb_r = (unsigned)s4[i] << 16;
+              float c, s;
+              __builtin_memcpy(&c, &cb, 4);
+              __builtin_memcpy(&s, &sb_r, 4);
+              lo[i] = _gang_float_to_bf16(v0 * c - v1 * s);
+              hi[i] = _gang_float_to_bf16(v0 * s + v1 * c);
+            }
+            uint64_t lo4, hi4;
+            __builtin_memcpy(&lo4, lo, 8);
+            __builtin_memcpy(&hi4, hi, 8);
+            auto *d_k = (__attribute__((address_space(1))) uint64_t *)(
+                (unsigned short *)k_cache_ptr + kv_row + 8 * wg_idx + g * 4);
+            d_k[0] = lo4;
+            d_k[(HEAD_DIM / 2) / 4] = hi4;
+          }
+        } else {
+          uint64_t v4;
+          __builtin_memcpy(&v4, val, 8);
+          *(__attribute__((address_space(1))) uint64_t *)(
+              (unsigned short *)v_cache_ptr + kv_row + (wg_idx - 4) * 16 +
+              g * 4) = v4;
+        }
+      }
+#endif
+
+#ifdef MPK_QKV_KSPLIT
+      // k_part 0 publishes its 4 AccVGPR floats and skips RoPE/KV; k_part 1
+      // waits, adds, and runs the epilogue. Same-XCD, different CUs. Payload
+      // is write-through so a later consumer cannot reuse a stale L2 line
+      // from last layer; ready is a system-scope poll.
+      {
+        int const slot =
+            _kvupd_get_xcd_id() * MPK_QKV_KSPLIT_MAX_TILE + wg_idx;
+        float *part = &g_qkv_kpart_acc[(slot * 256 + tid) * 4];
+        int *ready = &g_qkv_kpart_ready[slot];
+        if (k_part == 0) {
+          float4 v;
+          v.x = qa0;
+          v.y = qa1;
+          v.z = qa2;
+          v.w = qa3;
+          st_wt_f32x4(part, v);
+          // vmcnt is per-wave: s_barrier does not retire the other three
+          // waves' write-through stores. Drain first, then rendezvous, then
+          // publish.
+          asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+          __syncthreads();
+          if (tid == 0) {
+            st_wt_u32(ready, 1u);
+          }
+          continue;
+        }
+        if (tid == 0) {
+          while (ld_sys_s32(ready) < 1) {
+            __builtin_amdgcn_s_sleep(1);
+          }
+#ifdef MPK_QKV_KSPLIT_SHARED_NORM
+          // Same-XCD AccVGPR handshake: producer already drained its
+          // write-through stores. sc1 would drop this XCD's L2 -- that was
+          // part of the rejected K-split's +114 µs.
+          asm volatile("buffer_inv" ::: "memory");
+#else
+          asm volatile("buffer_inv" MPK_DEV_SC_INV "" ::: "memory");
+#endif
+        }
+        __syncthreads();
+        _gl_f32x4 pv;
+        asm volatile("global_load_dwordx4 %0, %1, off nt\n"
+                     "s_waitcnt vmcnt(0)"
+                     : "=v"(pv)
+                     : "v"(part)
+                     : "memory");
+        qa0 += pv[0];
+        qa1 += pv[1];
+        qa2 += pv[2];
+        qa3 += pv[3];
+        acc[0] = qa0;
+        acc[1] = qa1;
+        acc[2] = qa2;
+        acc[3] = qa3;
+        __syncthreads();
+        if (tid == 0) {
+          st_wt_u32(ready, 0u);
+        }
+      }
+#endif
+
+      MPK_QKVSUB(4);
+#ifdef MPK_QKV_ROPE_REG
+      // Wave w holds dims 8w..8w+7 (rows 0..7) and their RoPE partners
+      // 32+8w.. (rows 8..15); lane (g, col) holds rows g*4..g*4+3, so lanes
+      // g < 2 own the pairs and lane g ^ 2 carries the partner values.
+      if (wg_idx <= NUM_Q_PER_KV) {
+        if (tok_active) {
+          float const av[4] = {acc[0], acc[1], acc[2], acc[3]};
+          unsigned short const *b4 = (unsigned short const *)&epi_b4;
+          unsigned short val[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            unsigned bt = (unsigned)b4[i] << 16;
+            float bv;
+            __builtin_memcpy(&bv, &bt, 4);
+            val[i] = _gang_float_to_bf16(av[i] + bv);
+          }
+          unsigned short pv[4];
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            pv[i] = (unsigned short)__shfl_xor((int)val[i], 32, 64);
+          }
+          if (g < 2) {
+            unsigned short const *c4 = (unsigned short const *)&epi_c;
+            unsigned short const *s4 = (unsigned short const *)&epi_s;
+            unsigned short lo[4], hi[4];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+              unsigned v0b = (unsigned)val[i] << 16;
+              unsigned v1b = (unsigned)pv[i] << 16;
+              float v0, v1;
+              __builtin_memcpy(&v0, &v0b, 4);
+              __builtin_memcpy(&v1, &v1b, 4);
+              unsigned cb = (unsigned)c4[i] << 16;
+              unsigned sb_r = (unsigned)s4[i] << 16;
+              float c, s;
+              __builtin_memcpy(&c, &cb, 4);
+              __builtin_memcpy(&s, &sb_r, 4);
+              lo[i] = _gang_float_to_bf16(v0 * c - v1 * s);
+              hi[i] = _gang_float_to_bf16(v0 * s + v1 * c);
+            }
+            uint64_t lo4, hi4;
+            __builtin_memcpy(&lo4, lo, 8);
+            __builtin_memcpy(&hi4, hi, 8);
+            int const d = 8 * wave_tile + g * 4;
+            unsigned short *row;
+            if (wg_idx < NUM_Q_PER_KV) {
+              row = (unsigned short *)q_workspace_ptr +
+                    ((long long)tok_row_base + (pcol ? (long long)(MPK_QPAIR_DQ) : 0ll)) * q_ws_stride +
+                    (_kvupd_get_xcd_id() * NUM_Q_PER_KV + wg_idx) * HEAD_DIM;
+            } else {
+              row = (unsigned short *)k_cache_ptr +
+                    (long long)s_dst_idx[pcol] *
+                        MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+                    MPK_KV_HEAD_OFF(_kvupd_get_xcd_id(), HEAD_DIM);
+            }
+            auto *dst = (__attribute__((address_space(1))) uint64_t *)(row + d);
+            dst[0] = lo4;
+            dst[(HEAD_DIM / 2) / 4] = hi4;
+          }
+        }
+      } else
+#endif
+      {
+      // ── Fused KV_UPD epilogue (N-axis packed) ──────────────────────────
+      // Position metadata is per token and already in s_global_pos /
+      // s_dst_idx. RoPE scratch aliases the token region, which is dead now
+      // that the MFMA has retired.
+      //
+      // "Retired" is a per-WAVE property, and this is a 4-wave block. The asm
+      // above ends with s_waitcnt lgkmcnt(0), so when *this* wave falls out of
+      // it, *its* ds_reads have landed -- but nothing has ordered it against
+      // the other three waves, which may still be issuing the ds_read_b128
+      // pair that feeds their own MFMA. s_rope is byte 0 of
+      // s_tok_fp8, so wave 0's step-1 stores land exactly on token row 0's
+      // activations: s_rope halfword (t*HEAD_DIM + ...) is byte 128*t + ...,
+      // and token row 0's MFMA iteration i reads bytes [128*i, 128*i+128).
+      // Wave 0 writing rope token t therefore destroys iteration t of token
+      // row 0 for whichever wave has not read it yet.
+      //
+      // That makes the corruption window exactly TOK_ROWS of the 23 MFMA
+      // iterations -- it scales with the batch width, is confined to token row
+      // 0 (col == 0), and vanishes at TOK_ROWS == 1 only because a single
+      // iteration is a narrow enough target to almost always lose the race.
+      // It is why row 0's Q/K diverged from rows 1..B-1 with identical
+      // prompts, and why B=8 was the reliable repro.
+      //
+      // One block-wide rendezvous closes it: every wave's ds_reads are
+      // complete when it arrives here, so the aliased region really is dead
+      // before the first store. The epilogue's own __syncthreads calls are all
+      // *after* its step-1 stores and cannot substitute.
+#ifdef MPK_QKV_ROPE_NO_BAR
+      static_assert(TOK_ROWS == 1,
+                    "MPK_QKV_ROPE_NO_BAR is the TOK_ROWS==1 decode window only");
+#else
+      __syncthreads();
+#endif
+      int kv_head, kv_role;
+      _kvupd_head_role(wg_idx, n_wgs_per_xcd, NUM_Q_PER_KV, kv_head, kv_role);
+      unsigned short const *cos_base = (unsigned short const *)cos_ptr;
+      unsigned short const *sin_base = (unsigned short const *)sin_ptr;
+      unsigned short *s_rope = (unsigned short *)s_tok_fp8;
+      if (kv_role < NUM_Q_PER_KV) {
+        int q_head_global = kv_head * NUM_Q_PER_KV + kv_role;
+#ifdef MPK_QKV_EPI_PRELOAD
+#if defined(MPK_KV_SPREAD) || defined(MPK_QKV_PF3) || defined(MPK_QKV_KSPLIT)
+#error "MPK_QKV_EPI_PRELOAD is wired for the single-chain loop"
+#endif
+        _kvupd_rope_epilogue_packed_pre<HEAD_DIM, TOK_ROWS>(
+            (float const *)&acc, epi_b4, epi_c, epi_s, wave_tile, g, col, tid,
+            tok_active, n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS,
+            (unsigned short *)q_workspace_ptr, q_ws_stride, tok_row_base,
+            q_head_global * HEAD_DIM, s_rope);
+        if (false)
+#endif
+        _kvupd_rope_epilogue_packed<HEAD_DIM, TOK_ROWS>(
+            (float const *)&acc,
+            d_bias,
+            wg_idx,
+            wave_tile,
+            g,
+            col,
+            tid,
+            tok_active,
+            n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS,
+            cos_base,
+            sin_base,
+            s_global_pos,
+            (unsigned short *)q_workspace_ptr,
+            q_ws_stride,
+            tok_row_base,
+            q_head_global * HEAD_DIM,
+            OUTPUT_PER_WG,
+            s_rope
+#ifdef MPK_QKV_EPI_PF
+            ,
+            TOK_ROWS == 1,
+            epi_bias_pf[0],
+            epi_bias_pf[1],
+            epi_cos_pf,
+            epi_sin_pf
+#endif
+            );
+      } else if (kv_role == NUM_Q_PER_KV) {
+        // K: bias + RoPE, then scatter to the paged cache. Same three steps as
+        // the Q path but the destination row is a page slot, so it cannot go
+        // through the shared helper's contiguous store.
+        int const n_tok = n_valid_tok < TOK_ROWS ? n_valid_tok : TOK_ROWS;
+        if (tok_active) {
+          int d0 = wave_tile * 16 + g * 4;
+          uint64_t bias4;
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+#ifdef MPK_QKV_EPI_PF
+#error "MPK_QKV_EPI_PF and MPK_QKV_ROPE_REG / EPI_PRELOAD both preload the epilogue bias"
+#endif
+          bias4 = epi_b4;
+#else
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
+          __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+#endif
+          unsigned short const *b4 = (unsigned short const *)&bias4;
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            unsigned bt = (unsigned)b4[i] << 16;
+            float bv;
+            __builtin_memcpy(&bv, &bt, 4);
+            s_rope[col * HEAD_DIM + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+          }
+        }
+        __syncthreads();
+        constexpr int HALF = HEAD_DIM / 2;
+        for (int idx = tid; idx < TOK_ROWS * HALF; idx += 256) {
+          int t = idx / HALF;
+          if (t >= n_tok) {
+            continue;
+          }
+          int d = idx - t * HALF;
+          unsigned short *row = s_rope + t * HEAD_DIM;
+          int pos = s_global_pos[t];
+          unsigned short const *cos_row = cos_base + (long long)pos * HEAD_DIM;
+          unsigned short const *sin_row = sin_base + (long long)pos * HEAD_DIM;
+          unsigned v0b = (unsigned)row[d] << 16;
+          unsigned v1b = (unsigned)row[d + HALF] << 16;
+          float v0, v1;
+          __builtin_memcpy(&v0, &v0b, 4);
+          __builtin_memcpy(&v1, &v1b, 4);
+#if defined(MPK_QKV_EPI_PRELOAD)
+          (void)cos_row;
+          (void)sin_row;
+          unsigned cb = (epi_c & 0xFFFFu) << 16;
+          unsigned sb_r = (epi_s & 0xFFFFu) << 16;
+#elif defined(MPK_QKV_EPI_PF)
+          unsigned cb, sb_r;
+          if constexpr (TOK_ROWS == 1) {
+            cb = (unsigned)epi_cos_pf << 16;
+            sb_r = (unsigned)epi_sin_pf << 16;
+          } else {
+            cb = (unsigned)cos_row[d] << 16;
+            sb_r = (unsigned)sin_row[d] << 16;
+          }
+#else
+          unsigned cb = (unsigned)cos_row[d] << 16;
+          unsigned sb_r = (unsigned)sin_row[d] << 16;
+#endif
+          float c, s;
+          __builtin_memcpy(&c, &cb, 4);
+          __builtin_memcpy(&s, &sb_r, 4);
+          row[d] = _gang_float_to_bf16(v0 * c - v1 * s);
+          row[d + HALF] = _gang_float_to_bf16(v0 * s + v1 * c);
+        }
+        __syncthreads();
+        unsigned short *d_k = (unsigned short *)k_cache_ptr;
+        for (int idx = tid; idx < TOK_ROWS * HEAD_DIM; idx += 256) {
+          int t = idx / HEAD_DIM;
+          if (t >= n_tok) {
+            continue;
+          }
+          int d = idx - t * HEAD_DIM;
+          d_k[(long long)s_dst_idx[t] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM) + d] =
+              s_rope[idx];
+        }
+      } else {
+        // V: no RoPE, so lane (g, col) stores its own 4 values directly.
+        unsigned short *d_v = (unsigned short *)v_cache_ptr;
+        if (tok_active) {
+          int d0 = wave_tile * 16 + g * 4;
+          uint64_t bias4;
+#if defined(MPK_QKV_EPI_PRELOAD) || defined(MPK_QKV_ROPE_REG)
+          bias4 = epi_b4;
+#else
+#ifdef MPK_QKV_EPI_PF
+          if constexpr (TOK_ROWS == 1) {
+            bias4 = (uint64_t)epi_bias_pf[0] | ((uint64_t)epi_bias_pf[1] << 32);
+          } else
+#endif
+          __builtin_memcpy(&bias4, &d_bias[wg_idx * OUTPUT_PER_WG + d0], 8);
+#endif
+          unsigned short const *b4 = (unsigned short const *)&bias4;
+          long long row_off =
+              (long long)s_dst_idx[col] * MPK_KV_TOK_STRIDE(HEAD_DIM, kv_stride) +
+              MPK_KV_HEAD_OFF(kv_head, HEAD_DIM);
+#pragma unroll
+          for (int i = 0; i < 4; i++) {
+            unsigned bt = (unsigned)b4[i] << 16;
+            float bv;
+            __builtin_memcpy(&bv, &bt, 4);
+            d_v[row_off + d0 + i] = _gang_float_to_bf16(acc[i] + bv);
+          }
+        }
+      }
+      }
+    }
+  }
+
+  // ── No workspace zeroing ───────────────────────────────────────────────
+  // The old layout accumulated with atomicAdd, so it had to be cleared before
+  // the next layer could add into it. The per-slot layout is *assigned*, not
+  // accumulated: every (token, slot, hidden) element is written exactly once
+  // per layer by its one owning W2 tile, so there is nothing stale to clear.
+  // Dropping this also removes a full write-through pass over the workspace
+  // (st_wt bypasses L2 to HBM) from every layer. See moe_ws_layout.cuh.
+  //
+  // This holds only while coverage is total: a token routes to exactly
+  // MOE_WS_SLOTS experts and wg_idx partitions the hidden axis. Padding expert
+  // slots have no active token, write nothing, and own no (token, slot) pair,
+  // so they cannot leave a hole.
+
+  MPK_QKVSUB(5);
+#ifdef MPK_ENABLE_SUBPHASE_TIMING
+  if (_sp_rec) {
+    _sp_t4 = __builtin_amdgcn_s_memrealtime();
+    // Slot 1: QKV_KVUPD. [0]=ResAddF32+RMSNorm [1]=0(fused) [2]=FP8Quant
+    // [3]=MFMA [4]=KVUpdEpi
+    atomicAdd(&g_subphase_ns[1][0], (_sp_t1 - _sp_t0) * 10);
+    atomicAdd(&g_subphase_ns[1][1], (_sp_t2 - _sp_t1) * 10);
+    atomicAdd(&g_subphase_ns[1][2], (_sp_t3 - _sp_t2) * 10);
+    atomicAdd(&g_subphase_ns[1][3], (_sp_t3b - _sp_t3) * 10);
+    atomicAdd(&g_subphase_ns[1][4], (_sp_t4 - _sp_t3b) * 10);
+    atomicAdd(&g_subphase_cnt[1], 1ULL);
+  }
+#endif
+#ifdef MPK_VTN_QNODRAIN
+#ifndef MPK_QKV_EPOCH_PRODUCER_DRAIN
+#error "MPK_VTN_QNODRAIN relies on the producer drain before the QKV epoch arrival"
+#endif
+  // MPK_VTN_QNODRAIN: LDS-only closing barrier; the global stores drain before the epoch arrival.
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+  __syncthreads();
+#endif
+#ifndef MPK_QKVK_FOLD
+  MPK_QKVK_MARK(4);
+#endif
+#ifdef MPK_QT_TS
+#ifndef MPK_TOPK_SUB
+#error "MPK_QT_TS needs MPK_TOPK_SUB"
+#endif
+  if (tid == 0 && MPK_QROW_TAKE && MPK_TOPK_ARMED()) {
+    unsigned int const qt4 = (unsigned int)__builtin_amdgcn_s_memrealtime();
+    s_tk_acc[0] += (qt_t[1] - qt_t[0]) * 10;
+    s_tk_acc[1] += (qt_t[2] - qt_t[1]) * 10;
+    s_tk_acc[2] += (qt_t[3] - qt_t[2]) * 10;
+    s_tk_acc[3] += (qt4 - qt_t[3]) * 10;
+    s_tk_n++;
+  }
+#endif
+}
+
+} // namespace kernel

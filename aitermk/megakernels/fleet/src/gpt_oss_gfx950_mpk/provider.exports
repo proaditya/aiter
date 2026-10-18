@@ -1,0 +1,7 @@
+LIBAITER_MK_FLEET_MPK_GPTOSS_GFX950_1 {
+    global:
+        fleet_mpk_*;
+    local:
+        *;
+};
+

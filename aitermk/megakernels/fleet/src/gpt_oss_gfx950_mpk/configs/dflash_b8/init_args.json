@@ -1,0 +1,10 @@
+{
+ "my_rank": 0,
+ "num_workers": 248,
+ "num_local_schedulers": 8,
+ "num_remote_schedulers": 0,
+ "max_seq_length": 32769,
+ "total_num_requests": 1,
+ "eos_token_id": 2147483647,
+ "profiler": false
+}
